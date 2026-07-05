@@ -1,8 +1,8 @@
 {
     "engine": {
-        "repo": "https://github.com/cocos/cocos4.git",
+        "repo": "https://github.com/lutery/cocos4.git",
         "dist": "packages/engine",
-        "tag": "4.0.0-alpha.24"
+        "tag": "fix/deserialize-internal"
     },
     "external": {
         "repo": "https://github.com/cocos/cocos-engine-external.git",
