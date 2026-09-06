@@ -4,11 +4,17 @@ import { url2path, url2uuid } from '../utils';
 import EventEmitter from 'events';
 import { AssetManagerEvents, IAsset, IAssetInfo, IAssetDBInfo } from '../@types/private';
 import type { ThumbnailInfo, ThumbnailSize } from '../@types/protected/asset-handler';
-import assetQuery from './query';
+import assetQuery, { ASSET_TREE_INFO_DATA_KEYS } from './query';
 import assetOperation from './operation';
 import assetHandlerManager from './asset-handler';
 import animationGraphVariant from '../animation-graph-variant';
 import * as serializedData from '../serialized-data';
+import * as materialService from '../material-service';
+import {
+    extractImagePixelsFromFile,
+    type IExtractedImagePixels,
+    type IImagePixelExtractionOptions,
+} from '../image-processing';
 
 /**
  * 对外暴露一系列的资源查询、操作接口等
@@ -36,6 +42,7 @@ class AssetManager extends EventEmitter {
     queryAssetMtime = assetQuery.queryAssetMtime.bind(assetQuery);
     // ---------- operation ---------
     importAsset = assetOperation.importAsset.bind(assetOperation);
+    copyAsset = assetOperation.copyAsset.bind(assetOperation);
     saveAssetMeta = assetOperation.saveAssetMeta.bind(assetOperation);
     saveAsset = assetOperation.saveAsset.bind(assetOperation);
     createAsset = assetOperation.createAsset.bind(assetOperation);
@@ -51,6 +58,10 @@ class AssetManager extends EventEmitter {
     updateUserDataByPath = assetOperation.updateUserDataByPath.bind(assetOperation);
     querySerializedData = serializedData.querySerializedData;
     saveSerializedData = serializedData.saveSerializedData;
+    queryMaterial = materialService.queryMaterial;
+    queryMaterialEffect = materialService.queryEffect;
+    queryMaterialAllEffects = materialService.queryAllEffects;
+    saveMaterial = materialService.saveMaterial;
 
     // ---------- animation graph variant ---------
     queryAnimationGraphVariant = animationGraphVariant.query.bind(animationGraphVariant);
@@ -70,6 +81,18 @@ class AssetManager extends EventEmitter {
         if (!asset) { return null; }
         return assetHandlerManager.generateThumbnail(asset, size);
     }
+
+    async extractImagePixels(
+        urlOrUUIDOrPath: string,
+        options: IImagePixelExtractionOptions,
+    ): Promise<IExtractedImagePixels | null> {
+        const assetInfo = this.queryAssetInfo(urlOrUUIDOrPath);
+        if (!assetInfo?.file) {
+            return null;
+        }
+        return extractImagePixelsFromFile(assetInfo.file, options);
+    }
+
     getEffectBinPath() {
         return assetHandlerManager.getEffectBinPath();
     };
@@ -145,7 +168,7 @@ class AssetManager extends EventEmitter {
         if (!asset || !asset.uuid) {
             return null;
         }
-        return assetManager.queryAssetInfo(asset.uuid);
+        return assetManager.queryAssetInfo(asset.uuid, ASSET_TREE_INFO_DATA_KEYS);
     }
 
     private _snapshotAssetChangeInfo(asset: IAsset): IAssetInfo | null {
@@ -221,13 +244,13 @@ class AssetManager extends EventEmitter {
 
     _onAssetAdd = async (asset: IAsset) => {
         this._emitProgress(asset, 'processing');
-    }
+    };
     _onAssetChange = async (asset: IAsset) => {
         this._emitProgress(asset, 'processing');
-    }
+    };
     _onAssetDelete = async (asset: IAsset) => {
         this._emitProgress(asset, 'processing');
-    }
+    };
 
     _onAssetAdded = async (asset: IAsset) => {
         if (assetDBManager.ready) {
@@ -237,7 +260,7 @@ class AssetManager extends EventEmitter {
             return;
         }
         this._emitProgress(asset, 'success');
-    }
+    };
     _onAssetChanged = async (asset: IAsset) => {
         if (assetDBManager.ready) {
             this.emit('asset-change', asset);
@@ -246,7 +269,7 @@ class AssetManager extends EventEmitter {
             return;
         }
         this._emitProgress(asset, 'success');
-    }
+    };
     _onAssetDeleted = async (asset: IAsset) => {
         if (assetDBManager.ready) {
             const removedInfo = this._snapshotAssetChangeInfo(asset);
@@ -257,7 +280,7 @@ class AssetManager extends EventEmitter {
             return;
         }
         this._emitProgress(asset, 'success');
-    }
+    };
 
     /**
      * 注册数据库初始化完全完成后的事件监听。
@@ -351,6 +374,7 @@ export interface TypedAssetManager extends EventEmitter {
     queryAssetMtime: typeof assetQuery.queryAssetMtime;
 
     importAsset: typeof assetOperation.importAsset;
+    copyAsset: typeof assetOperation.copyAsset;
     saveAssetMeta: typeof assetOperation.saveAssetMeta;
     saveAsset: typeof assetOperation.saveAsset;
     createAsset: typeof assetOperation.createAsset;
@@ -366,6 +390,10 @@ export interface TypedAssetManager extends EventEmitter {
     updateUserDataByPath: typeof assetOperation.updateUserDataByPath;
     querySerializedData: typeof serializedData.querySerializedData;
     saveSerializedData: typeof serializedData.saveSerializedData;
+    queryMaterial: typeof materialService.queryMaterial;
+    queryMaterialEffect: typeof materialService.queryEffect;
+    queryMaterialAllEffects: typeof materialService.queryAllEffects;
+    saveMaterial: typeof materialService.saveMaterial;
 
     queryAnimationGraphVariant: typeof animationGraphVariant.query;
     changeAnimationGraphVariant: typeof animationGraphVariant.change;
@@ -380,6 +408,10 @@ export interface TypedAssetManager extends EventEmitter {
     getEffectBinPath: typeof assetHandlerManager.getEffectBinPath;
 
     generateThumbnail(urlOrUUIDOrPath: string, size?: ThumbnailSize): Promise<ThumbnailInfo | null>;
+    extractImagePixels(
+        urlOrUUIDOrPath: string,
+        options: IImagePixelExtractionOptions,
+    ): Promise<IExtractedImagePixels | null>;
 
     onReady: typeof assetManager.onReady;
     onDBReady: typeof assetManager.onDBReady;

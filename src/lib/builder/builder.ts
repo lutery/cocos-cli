@@ -6,8 +6,7 @@ import type { BuildCacheScope, ClearCacheResult } from '../../core/builder/cache
 export type * from '../../core/builder/@types/private';
 export type * from '../../core/builder/@types/config-export';
 export type { BuildCacheScope, ClearCacheResult };
-
-export async function init(platform?: string): Promise<void> {
+export async function init(platform?: string[]): Promise<void> {
     const builder = await import('../../core/builder');
     return builder.init(platform);
 }
@@ -52,9 +51,19 @@ export async function run(platform: Platform, dest: string) {
     return Launcher.run(platform, dest);
 }
 
+export async function getPreviewUrl(dest: string, platform?: string): Promise<string> {
+    const commonUtils = await import('../../core/builder/platforms/web-common/utils');
+    return commonUtils.getPreviewUrl(dest, platform);
+}
+
 export async function upload(platform: Platform, dest: string, accessToken?: string) {
     const { default: Launcher } = await import('../../core/launcher');
     return Launcher.upload(platform, dest, accessToken);
+}
+
+export async function publish(platform: Platform, dest: string) {
+    const { default: Launcher } = await import('../../core/launcher');
+    return Launcher.publish(platform, dest);
 }
 
 export async function queryBuildConfig(): Promise<BuildConfiguration> {

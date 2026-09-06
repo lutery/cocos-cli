@@ -8,9 +8,11 @@ import { ISettings, IPhysicsConfig } from '../../../../../@types';
 import { IInternalBuildOptions } from '../../../../../@types/protected';
 import utils from '../../../../../../base/utils';
 import { Engine } from '../../../../../../engine';
+import { resolveCustomJointTextureLayouts } from '../../../../../../engine/joint-texture-layout';
 import { configurationManager } from '../../../../../../configuration';
 import { ISplashSetting } from '../../../../../../engine/@types/config';
 import { GlobalPaths } from '../../../../../../../global';
+import { cloneConfigValue } from '../../../../../share/utils';
 
 const layerMask: number[] = [];
 for (let i = 0; i <= 19; i++) {
@@ -43,7 +45,7 @@ export async function patchOptionsToSettings(options: IInternalBuildOptions, set
     settings.rendering.renderPipeline = options.renderPipeline === defaultPipeline ? '' : options.renderPipeline;
     settings.rendering.customPipeline = options.customPipeline;
     const { customJointTextureLayouts, downloadMaxConcurrency } = Engine.getConfig();
-    settings.animation.customJointTextureLayouts = customJointTextureLayouts || [];
+    settings.animation.customJointTextureLayouts = await resolveCustomJointTextureLayouts(customJointTextureLayouts);
     if (options.includeModules.includes('custom-pipeline')) {
         settings.rendering.effectSettingsPath = 'src/effect.bin';
     }
@@ -57,17 +59,17 @@ export async function patchOptionsToSettings(options: IInternalBuildOptions, set
 export async function getSplashSettings(useSplashScreen: boolean, preview: boolean, defaultSplashScreen: ISplashSetting, splashScreen: ISplashSetting): Promise<ISplashSetting> {
     if (useSplashScreen !== false || preview) {
         try {
-            splashScreen = Object.assign({}, defaultSplashScreen, splashScreen);
+            splashScreen = cloneConfigValue(Object.assign({}, defaultSplashScreen, splashScreen));
             return formatSplashScreen(splashScreen);
         } catch (error) {
             console.error(error);
             console.error(i18n.t('builder.error.missing_splash_tips', {
                 splashScreen: JSON.stringify(splashScreen),
             }));
-            return formatSplashScreen(defaultSplashScreen!);
+            return formatSplashScreen(cloneConfigValue(defaultSplashScreen!));
         }
     } else {
-        const defaultSplashSettings = formatSplashScreen(defaultSplashScreen!);
+        const defaultSplashSettings = formatSplashScreen(cloneConfigValue(defaultSplashScreen!));
         defaultSplashSettings.totalTime = 0;
         delete defaultSplashSettings.logo;
         delete defaultSplashSettings.background;
@@ -87,7 +89,7 @@ export async function getPhysicsConfig(includeModules: string[], physicsConfig: 
     }
 
     // 不论引擎对物理模块的剔除情况，物理配置都输出
-    return Object.assign({ physicsEngine }, physicsConfig);
+    return Object.assign({ physicsEngine }, cloneConfigValue(physicsConfig));
 }
 
 export function formatSplashScreen(splashScreen: ISplashSetting) {

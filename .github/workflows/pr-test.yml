@@ -95,9 +95,18 @@ jobs:
         env:
           MINIMAL_DOWNLOAD_TOOLS: 'true'
 
+      - name: Type check
+        id: type-check
+        run: npx tsc -b
+
       - name: Run unit tests
         id: unit-tests
         run: npm run test:quiet
+
+      # pull_request 与 issue_comment 的 PR 标题字段不同，取当前事件中存在的标题进行检测。
+      - name: Run AssetDB package tests
+        if: runner.os == 'Windows' && contains(github.event.pull_request.title || github.event.issue.title, 'asset-db')
+        run: npm run test:asset-db
 
       - name: Run E2E tests
         id: e2e-tests

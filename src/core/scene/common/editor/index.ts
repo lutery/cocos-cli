@@ -19,10 +19,10 @@ export * from './scene';
  * 事件类型
  */
 export interface IEditorEvents {
-    'editor:open': [];
+    'editor:open': [scene?: any];
     'editor:close': [];
     'editor:save': [];
-    'editor:reload': [];
+    'editor:reload': [scene?: any];
 }
 
 /**
@@ -87,6 +87,12 @@ export interface IEditorService extends IServiceEvents {
      * 获取当前打开的资产
      */
     queryCurrent(): Promise<TEditorEntity | null>;
+
+    /**
+     * 序列化当前正在编辑的场景（含未保存改动），返回可被 loadWithJson 加载的 JSON 字符串。
+     * 用于「Preview in Editor」把编辑器实时场景交给游戏运行时预览。
+     */
+    querySceneSerializedData(): Promise<string>;
 
     /**
      *

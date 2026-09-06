@@ -186,6 +186,37 @@ export const SchemaSerializedAssetPatch = z.union([
     z.record(z.string(), z.any()),
 ]).describe('Serialized asset patch. Prefer IProperty or full dump patches; raw value maps are accepted only for convenience.');
 
+// Material API related // Material API 相关
+export const SchemaMaterialEffectNameOrUuid = z.string().min(1).describe('Effect UUID, asset URL/path, or effect name');
+export const SchemaMaterialEffectInfo = z.object({
+    uuid: z.string().min(1).describe('Effect asset UUID'),
+    name: z.string().describe('Effect name'),
+    hideInEditor: z.boolean().optional().describe('Whether this effect should be hidden in editor UI'),
+    assetPath: z.string().describe('Effect asset file path or URL'),
+}).describe('Material effect list item');
+
+export const SchemaMaterialPassDump = z.object({
+    index: z.number().int().nonnegative().describe('Pass index'),
+    name: z.string().optional().describe('Pass name'),
+    phase: z.string().optional().describe('Render phase'),
+    switch: SchemaSerializedAssetProperty.optional().describe('Pass switch define dump'),
+    propertyIndex: SchemaSerializedAssetProperty.describe('Property source pass index dump'),
+    props: z.array(SchemaSerializedAssetProperty).describe('Material property dumps'),
+    defines: z.array(SchemaSerializedAssetProperty).describe('Material define dumps'),
+    states: SchemaSerializedAssetProperty.describe('Pipeline state dump'),
+}).describe('Material pass dump');
+
+export const SchemaMaterialTechniqueDump = z.object({
+    name: z.string().optional().describe('Technique name'),
+    passes: z.array(SchemaMaterialPassDump).describe('Technique pass dumps'),
+}).describe('Material technique dump');
+
+export const SchemaMaterialDump = z.object({
+    effect: z.string().min(1).describe('Referenced effect UUID'),
+    technique: z.number().int().nonnegative().describe('Selected technique index'),
+    data: z.array(SchemaMaterialTechniqueDump).describe('Technique dump list'),
+}).describe('Creator-compatible Material dump');
+
 // Return value Schema // 返回值 Schema
 export const SchemaAssetInfoResult = SchemaAssetInfo.nullable().describe('Asset detailed information object, including name, type, path, UUID, etc.'); // 资源详细信息对象，包含名称、类型、路径、UUID 等字段
 export const SchemaAssetMetaResult = SchemaAssetMeta.nullable().describe('Asset metadata object, including import configuration, user data, etc.'); // 资源元数据对象，包含导入配置、用户数据等
@@ -203,6 +234,9 @@ export const SchemaSerializedAssetResult = z.object({
     importer: z.string().describe('Asset importer name'), // 资源导入器名称
     dump: SchemaSerializedAssetDump.describe('Creator-compatible raw dump'), // Creator 兼容 raw dump
 }).nullable().describe('Serialized asset query/save result'); // 序列化资源 query/save 结果
+export const SchemaMaterialEffectsResult = z.record(z.string(), SchemaMaterialEffectInfo).describe('Available material effects keyed by effect UUID');
+export const SchemaMaterialEffectResult = z.array(SchemaMaterialTechniqueDump).describe('Material effect technique dump list');
+export const SchemaMaterialResult = SchemaMaterialDump.describe('Material dump result');
 export const SchemaRefreshDirResult = z.null().describe('Refresh asset directory result'); // 刷新资源目录结果
 export const SchemaUUIDResult = z.string().nullable().describe('Unique identifier UUID of the asset'); // 资源的唯一标识符 UUID
 export const SchemaPathResult = z.string().nullable().describe('File system path of the asset'); // 资源的文件系统路径
@@ -275,6 +309,8 @@ export type TAssetOperationOption = z.infer<typeof SchemaAssetOperationOption> |
 export type TSourcePath = z.infer<typeof SchemaSourcePath>;
 export type TAssetData = z.infer<typeof SchemaAssetData>;
 export type TSerializedAssetPatch = z.infer<typeof SchemaSerializedAssetPatch>;
+export type TMaterialEffectNameOrUuid = z.infer<typeof SchemaMaterialEffectNameOrUuid>;
+export type TMaterialDump = z.infer<typeof SchemaMaterialDump>;
 export type TAssetInfoResult = z.infer<typeof SchemaAssetInfoResult>;
 export type TAssetMetaResult = z.infer<typeof SchemaAssetMetaResult>;
 export type TCreateMapResult = z.infer<typeof SchemaCreateMapResult>;
@@ -287,6 +323,9 @@ export type TImportedAssetResult = z.infer<typeof SchemaImportedAssetResult>;
 export type TReimportResult = z.infer<typeof SchemaAssetInfoResult>;
 export type TSaveAssetResult = z.infer<typeof SchemaSaveAssetResult>;
 export type TSerializedAssetResult = z.infer<typeof SchemaSerializedAssetResult>;
+export type TMaterialEffectsResult = z.infer<typeof SchemaMaterialEffectsResult>;
+export type TMaterialEffectResult = z.infer<typeof SchemaMaterialEffectResult>;
+export type TMaterialResult = z.infer<typeof SchemaMaterialResult>;
 export type TRefreshDirResult = z.infer<typeof SchemaRefreshDirResult>;
 export type TUUIDResult = z.infer<typeof SchemaUUIDResult>;
 export type TPathResult = z.infer<typeof SchemaPathResult>;
@@ -346,28 +385,29 @@ export const SchemaAssetConfig = z.object({
 export const SchemaAssetConfigMapResult = z.record(z.string(), SchemaAssetConfig).describe('Asset configuration map, key is asset handler name, value is corresponding configuration information'); // 资源配置映射表，键为资源处理器名称，值为对应的配置信息
 export type TAssetConfigMapResult = z.infer<typeof SchemaAssetConfigMapResult>;
 
-export const SchemaAssetPropertySchemaOption = z.object({
-    label: z.string().describe('Option display label'), // 选项显示名称
-    value: z.union([z.string(), z.number(), z.boolean()]).describe('Option value'), // 选项值
-}).describe('Asset property schema option'); // 资源属性 schema 选项
-
 export const SchemaAssetPropertySchema: z.ZodType<any> = z.lazy(() => z.object({
-    label: z.string().describe('Property display label'), // 属性显示名称
-    description: z.string().optional().describe('Property description'), // 属性描述
-    type: z.enum(['string', 'number', 'boolean', 'enum', 'asset', 'array', 'object']).describe('Property value/control type'), // 属性值或控件类型
-    default: z.any().optional().describe('Static default value'), // 静态默认值
-    options: z.array(SchemaAssetPropertySchemaOption).optional().describe('Enum/select options'), // 枚举/下拉选项
-    assetType: z.string().optional().describe('Allowed Cocos asset type for asset picker'), // Asset Picker 允许的 Cocos 资源类型
-    min: z.number().optional().describe('Minimum number value'), // 数值最小值
-    max: z.number().optional().describe('Maximum number value'), // 数值最大值
-    step: z.number().optional().describe('Number input step'), // 数值步进
-    readOnly: z.boolean().optional().describe('Whether the property is read-only'), // 是否只读
-    order: z.number().optional().describe('Display order'), // 展示顺序
-    properties: z.record(z.string(), SchemaAssetPropertySchema).optional().describe('Nested object properties'), // 嵌套对象属性
-    items: z.union([SchemaAssetPropertySchema, z.array(SchemaAssetPropertySchema)]).optional().describe('Array item schema'), // 数组元素 schema
-}).describe('Standardized asset import property schema')); // 标准化资源导入属性 schema
+    type: z.enum(['string', 'number', 'boolean', 'object', 'array']).describe('Configuration property value type'),
+    default: z.any().optional().describe('Default value'),
+    title: z.string().optional().describe('Display title'),
+    description: z.string().optional().describe('Property description'),
+    enum: z.array(z.union([z.string(), z.number(), z.boolean()])).optional().describe('Allowed enum values'),
+    enumDescriptions: z.array(z.string()).optional().describe('Display text for enum values'),
+    minimum: z.number().optional().describe('Minimum number value'),
+    maximum: z.number().optional().describe('Maximum number value'),
+    step: z.number().optional().describe('Number input step'),
+    order: z.number().optional().describe('Display order'),
+    properties: z.record(z.string(), SchemaAssetPropertySchema).optional().describe('Nested object properties'),
+    items: z.union([SchemaAssetPropertySchema, z.array(SchemaAssetPropertySchema)]).optional().describe('Array item schema'),
+    additionalProperties: z.union([z.boolean(), SchemaAssetPropertySchema]).optional().describe('Additional object property schema'),
+    required: z.array(z.string()).optional().describe('Required nested object property keys'),
+    ui: z.string().optional().describe('Preferred UI control'),
+    assetType: z.string().optional().describe('Allowed Cocos asset type for an asset picker'),
+    valueField: z.string().optional().describe('Field used as the selected value'),
+    displayFields: z.array(z.string()).optional().describe('Fields displayed by the UI control'),
+    query: z.record(z.string(), z.unknown()).optional().describe('Additional UI query constraints'),
+})).describe('Cocos configuration property schema for asset import properties');
 
-export const SchemaAssetPropertySchemaResult = z.record(z.string(), SchemaAssetPropertySchema).describe('Asset import property schema map, key is property name'); // 资源导入属性 schema 映射
+export const SchemaAssetPropertySchemaResult = z.record(z.string(), SchemaAssetPropertySchema).describe('Asset import property schema map, key is property name, value follows ICocosConfigurationPropertySchema');
 export type TAssetPropertySchemaResult = z.infer<typeof SchemaAssetPropertySchemaResult>;
 
 export const SchemaAnimationGraphVariantDump = z.object({

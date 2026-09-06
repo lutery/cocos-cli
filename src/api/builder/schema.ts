@@ -1,13 +1,18 @@
 import { z } from 'zod';
+import { SchemaAssetDbUrl, SchemaAssetDbUrlOrUUID } from '../base/schema-asset-db-url';
 
 // ==================== Basic Type Definitions ==================== // 基础类型定义
 
 // Scene Reference // 场景引用
 export const SchemaSceneRef = z.object({
-    url: z.string().describe('Scene URL'), // 场景 URL
-    uuid: z.string().describe('Scene UUID') // 场景 UUID
-}).describe('Scene Reference'); // 场景引用
+    url: SchemaAssetDbUrl.describe('Scene URL. Required.'),
+    uuid: z.string().min(1).describe('Scene UUID. Required.'),
+}).describe('Scene Reference. Each scene item must include both url and uuid.');
 
+export const SchemaStartScene = z.union([
+    SchemaAssetDbUrlOrUUID,
+    z.literal(''),
+]).describe('First scene to enter after opening the game. Use a db url or uuid; an empty string means unset and the builder will use the default scene.');
 // Polyfills Configuration // Polyfills 配置
 export const SchemaPolyfills = z.object({
     asyncFunctions: z.boolean().optional().describe('Whether async function polyfill is needed'), // 是否需要 async 函数 polyfill
@@ -41,7 +46,20 @@ export type TBuildTemplateName = z.infer<typeof SchemaBuildTemplateName>;
 // ==================== Platform Specific Packages Configuration ==================== // 平台特定的 Packages 配置
 
 // Web Desktop Platform Configuration // Web Desktop 平台配置
-export const SchemaWebDesktopPackages = z.object({
+const SchemaOpenPaasWebPackageRuntimeFields = z.object({
+    appid: z.string().optional().describe('OpenPaaS game id'),
+    app_id: z.string().optional().describe('Legacy OpenPaaS game id field'),
+    versionName: z.string().optional().describe('OpenPaaS web package version name'),
+    uploadEnv: z.enum(['dev', 'fat', 'prod']).optional().describe('OpenPaaS upload environment'),
+    accessToken: z.string().optional().describe('OpenPaaS access token'),
+    codeVersion: z.string().optional().describe('OpenPaaS code version'),
+    bridgeLink: z.string().optional().describe('OpenPaaS web bridge script link'),
+    bridgeBuildToken: z.string().optional().describe('OpenPaaS web bridge build token'),
+    entryPath: z.string().optional().describe('Web package entry path'),
+    encryptKey: z.string().optional().describe('OpenPaaS web package encryption key'),
+});
+
+export const SchemaWebDesktopPackages = SchemaOpenPaasWebPackageRuntimeFields.extend({
     useWebGPU: z.boolean().default(false).describe('Whether to use WebGPU rendering backend'), // 是否使用 WEBGPU 渲染后端
     resolution: z.object({
         designHeight: z.number().describe('Design Height'), // 设计高度
@@ -50,7 +68,7 @@ export const SchemaWebDesktopPackages = z.object({
 }).describe('Web Desktop Platform Configuration'); // Web Desktop 平台配置
 
 // Web Mobile Platform Configuration // Web Mobile 平台配置
-export const SchemaWebMobilePackages = z.object({
+export const SchemaWebMobilePackages = SchemaOpenPaasWebPackageRuntimeFields.extend({
     useWebGPU: z.boolean().default(false).describe('Whether to use WebGPU rendering backend'), // 是否使用 WEBGPU 渲染后端
     orientation: z.enum(['portrait', 'landscape', 'auto']).default('auto').describe('Device Orientation'), // 设备方向
     embedWebDebugger: z.boolean().default(false).describe('Whether to embed Web debugger'), // 是否嵌入 Web 端调试工具
@@ -118,7 +136,7 @@ const BuildConfigCoreFields = z.object({
 
     // Scene Configuration // 场景配置
     scenes: z.array(SchemaSceneRef).describe('List of scenes to build, defaults to all scenes'), // 构建场景列表，默认为全部场景
-    startScene: z.string().describe('First scene to enter after opening the game, supports db url and uuid formats'), // 打开游戏后进入的第一个场景，支持 db url 和 uuid 格式
+    startScene: SchemaStartScene.describe('First scene to enter after opening the game. Use a db url or uuid; an empty string means unset and the builder will use the default scene.'), // 打开游戏后进入的第一个场景，支持 db url 和 uuid 格式
 
     // Build Mode // 构建模式
     debug: z.boolean().describe('Whether it is debug mode'), // 是否是调试模式
@@ -152,7 +170,7 @@ const BuildConfigCoreFields = z.object({
     useSplashScreen: z.boolean().describe('Whether to use custom splash screen'), // 是否使用自定义启动画面
 
     // Build Stages // 构建阶段
-    nextStages: z.array(z.enum(['make', 'run', 'upload'])).describe('Specify subsequent combined build stages, multiple can be specified'), // 指定后续联合的构建阶段，可指定多个
+    nextStages: z.array(z.enum(['make', 'run', 'upload', 'publish'])).describe('Specify subsequent combined build stages, multiple can be specified'), // 指定后续联合的构建阶段，可指定多个
 
     // Cache Configuration // 缓存配置
     useCacheConfig: z.object({
@@ -186,7 +204,7 @@ export const SchemaWebDesktopBuildOption = SchemaBuildBaseOption
     .extend({
         platform: z.literal('web-desktop').describe('Build Platform'), // 构建平台
         packages: z.object({
-            'web-desktop': SchemaWebDesktopPackages.partial()
+            'web-desktop': SchemaWebDesktopPackages.partial().catchall(z.any())
         }).optional().describe('Web Desktop Platform Specific Configuration') // Web Desktop 平台特定配置
     })
     .describe('Web Desktop Complete Build Options (all fields optional)'); // Web Desktop 完整构建选项（所有字段可选）
@@ -196,7 +214,7 @@ export const SchemaWebMobileBuildOption = SchemaBuildBaseOption
     .extend({
         platform: z.literal('web-mobile').describe('Build Platform'), // 构建平台
         packages: z.object({
-            'web-mobile': SchemaWebMobilePackages.partial()
+            'web-mobile': SchemaWebMobilePackages.partial().catchall(z.any())
         }).optional().describe('Web Mobile Platform Specific Configuration') // Web Mobile 平台特定配置
     })
     .describe('Web Mobile Complete Build Options (all fields optional)'); // Web Mobile 完整构建选项（所有字段可选）
@@ -350,6 +368,12 @@ export const SchemaUploadResult = SchemaResultBase.extend({
     }).passthrough().optional().describe('Custom fields after uploading the build package, in object format'), // 上传构建产物后的自定义字段
 }).nullable().describe('Result after uploading the build package'); // 上传构建产物后的结果
 
+export const SchemaPublishResult = SchemaResultBase.extend({
+    custom: z.object({
+        publish: z.any().optional().describe('Platform publish result'), // 平台发布结果
+    }).passthrough().optional().describe('Custom fields after publishing the build package, in object format'), // 发布构建产物后的自定义字段
+}).nullable().describe('Result after publishing the build package'); // 发布构建产物后的结果
+
 export const SchemaPreviewSettingsResult = z.object({
     settings: z.object({
         CocosEngine: z.string().describe('Cocos Engine Version'), // Cocos Engine 版本
@@ -410,6 +434,7 @@ export type TBuildResultData = z.infer<typeof SchemaBuildResult>;
 export type IMakeResultData = z.infer<typeof SchemaMakeResult>;
 export type IRunResultData = z.infer<typeof SchemaBuildResult>;
 export type IUploadResultData = z.infer<typeof SchemaUploadResult>;
+export type IPublishResultData = z.infer<typeof SchemaPublishResult>;
 export type TBundleConfig = z.infer<typeof SchemaBundleConfig>;
 export type TPolyfills = z.infer<typeof SchemaPolyfills>;
 export type TSceneRef = z.infer<typeof SchemaSceneRef>;

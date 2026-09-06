@@ -1,8 +1,101 @@
 import { Request, Response, NextFunction } from 'express';
-import path, { join } from 'path';
+import path, { isAbsolute, join, relative } from 'path';
 import { pathExists, stat, readFile } from 'fs-extra';
 import { GlobalPaths } from '../../global';
 import { readFileSync } from 'fs';
+import {
+    CUSTOM_PIPELINE_MODULE,
+    deriveGraphicsConfigFromCustomPipeline,
+    hasOwnConfigKey,
+    mergeGraphicsConfigWithModules,
+    normalizeIncludeModulesWithGraphics,
+} from '../engine/graphics-config';
+
+function sendQuickPackChunk(res: Response, filePath: string): void {
+    // QuickPack may emit chunks under project temp paths used by smoke workspaces.
+    // The path is resolved by the loader, not by raw URL-to-file joining.
+    res.sendFile(filePath, { dotfiles: 'allow' });
+}
+
+let libraryDirsCache: string[] | null = null;
+
+async function getLibraryDirs(): Promise<string[]> {
+    if (libraryDirsCache) {
+        return libraryDirsCache;
+    }
+    const { assetDBManager } = await import('../assets');
+    const dirs = Object.values(assetDBManager.assetDBInfo)
+        .map((info: any) => info.library)
+        .filter((v): v is string => !!v);
+    libraryDirsCache = Array.from(new Set(dirs));
+    return libraryDirsCache;
+}
+
+async function findLibraryFileByRelativePath(relPath: string): Promise<string | undefined> {
+    const dirs = await getLibraryDirs();
+    for (const dir of dirs) {
+        const full = join(dir, relPath);
+        const rel = relative(dir, full);
+        if (rel.startsWith('..') || isAbsolute(rel)) {
+            continue;
+        }
+        if (await pathExists(full) && (await stat(full)).isFile()) {
+            return full;
+        }
+    }
+    return undefined;
+}
+
+function decodePathParam(value: string): string {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+async function queryFreshEngineModules(fallbackModules: string[]): Promise<string[]> {
+    try {
+        let modules = fallbackModules;
+        const { configurationManager } = await import('../configuration');
+        const fse = await import('fs-extra');
+        const configPath = await configurationManager.getConfigPath();
+        if (await fse.pathExists(configPath)) {
+            const json = await fse.readJSON(configPath);
+            const engineCfg = json?.engine;
+            if (engineCfg) {
+                // 与 Engine.syncConfig 的解析一致：优先 engine.includeModules；
+                // 否则取选中的模块配置 engine.configs[globalConfigKey].includeModules。
+                let diskModules = Array.isArray(engineCfg.includeModules)
+                    ? engineCfg.includeModules
+                    : undefined;
+                if (!diskModules && engineCfg.configs) {
+                    const key = engineCfg.globalConfigKey || Object.keys(engineCfg.configs)[0];
+                    const selectedModules = engineCfg.configs?.[key]?.includeModules;
+                    diskModules = Array.isArray(selectedModules) ? selectedModules : undefined;
+                }
+                const baseModules = diskModules ?? modules;
+                if (hasOwnConfigKey(engineCfg, 'graphics')) {
+                    const graphics = mergeGraphicsConfigWithModules(baseModules, engineCfg.graphics);
+                    modules = normalizeIncludeModulesWithGraphics(baseModules, graphics);
+                } else if (hasOwnConfigKey(engineCfg, 'customPipeline')) {
+                    const graphics = deriveGraphicsConfigFromCustomPipeline(engineCfg.customPipeline, baseModules);
+                    modules = normalizeIncludeModulesWithGraphics(baseModules, graphics);
+                } else if (diskModules) {
+                    modules = diskModules;
+                }
+            }
+        }
+        return modules;
+    } catch (error) {
+        console.debug('[engine/modules] read project config failed, fallback to cached:', error);
+        return fallbackModules;
+    }
+}
+
+function getAssetLibraryBaseUrl(serverBaseUrl: string): string {
+    return `${serverBaseUrl}/scripting/asset-library`;
+}
 
 /**
  * 动态预览的共享资源路由。
@@ -12,6 +105,22 @@ import { readFileSync } from 'fs';
  * 不包含各自专属的 `/` 入口路由。
  */
 export const scriptingRoutes = [
+    {
+        url: '/userland/macro',
+        async handler(req: Request, res: Response, next: NextFunction) {
+            try {
+                const { default: scripting } = await import('../../core/scripting');
+                const macroPath = join(scripting.projectPath, 'temp', 'programming', 'custom-macro.js');
+                if (!(await pathExists(macroPath))) {
+                    return next();
+                }
+                res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+                res.sendFile(macroPath);
+            } catch (err) {
+                next(err);
+            }
+        },
+    },
     {
         url: '/scripting/web-env',
         async handler(req: Request, res: Response, next: NextFunction) {
@@ -80,11 +189,13 @@ export const scriptingRoutes = [
                         filePath = fallbackPath;
                     }
                 }
-                // 目录白名单：只允许读取引擎目录下的文件（editor-stub 请求的路径均来自
-                // query-engine-info 返回的 native/typescript 路径），拒绝任意系统文件读取。
+                // 目录白名单：只允许读取引擎目录 + 当前项目目录下的文件，拒绝任意系统文件读取。
+                // editor-stub 的请求来自两处：引擎 native/typescript 路径（wasm 等），以及场景编辑器
+                // 预览的 ScriptService.init 通过 window.require 读取项目编译脚本（<project>/library/**）。
                 const { Engine } = await import('../engine');
                 const info: any = Engine.getInfo();
-                const allowedRoots = [GlobalPaths.enginePath, info?.native?.path, info?.typescript?.path]
+                const { default: scripting } = await import('../../core/scripting');
+                const allowedRoots = [GlobalPaths.enginePath, info?.native?.path, info?.typescript?.path, scripting.projectPath]
                     .filter((p): p is string => !!p)
                     .map((p) => path.resolve(p));
                 const resolved = path.resolve(filePath);
@@ -127,7 +238,7 @@ export const scriptingRoutes = [
         url: /^\/query-asset-info\/(.+)$/,
         async handler(req: Request, res: Response, next: NextFunction) {
             try {
-                const uuid = req.params[0];
+                const uuid = decodePathParam(req.params[0]);
                 const { assetManager } = await import('../assets');
                 const assetInfo = assetManager.queryAssetInfo(uuid);
                 if (assetInfo) {
@@ -158,10 +269,39 @@ export const scriptingRoutes = [
         },
     },
     {
+        // Imported asset files requested through the explicit asset-library base.
+        // Supports both library/<uuid-prefix>/<uuid>.<ext> and
+        // library/<uuid-prefix>/<uuid>/<filename>.
+        url: /^\/scripting\/asset-library\/([\da-f]{2})\/([\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}(?:@[^.\/]+)?)(?:\.([^/?]+)|\/([^/?]+))$/i,
+        async handler(req: Request, res: Response, next: NextFunction) {
+            try {
+                const match = req.path.match(/^\/scripting\/asset-library\/([\da-f]{2})\/([\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}(?:@[^.\/]+)?)(?:\.([^/?]+)|\/([^/?]+))$/i);
+                if (!match) {
+                    return next();
+                }
+                const [, dir, uuid, ext, filename] = match;
+                const libraryKey = filename || `.${ext}`;
+                const relativePath = filename ? `${dir}/${uuid}/${filename}` : `${dir}/${uuid}.${ext}`;
+
+                const { assetManager } = await import('../assets');
+                const file = assetManager.queryAssetInfo(uuid)?.library?.[libraryKey]
+                    ?? await findLibraryFileByRelativePath(relativePath);
+                if (!file) {
+                    return next();
+                }
+
+                res.set('Cache-Control', 'no-store');
+                res.sendFile(file, { dotfiles: 'allow' });
+            } catch (err) {
+                next(err);
+            }
+        },
+    },
+    {
         url: /^\/query-extname\/(.+)$/,
         async handler(req: Request, res: Response, next: NextFunction) {
             try {
-                const uuid = req.params[0];
+                const uuid = decodePathParam(req.params[0]);
                 const { assetManager } = await import('../assets');
                 const assetInfo = assetManager.queryAssetInfo(uuid);
                 if (assetInfo?.library?.['.bin'] && Object.keys(assetInfo.library).length === 1) {
@@ -226,15 +366,71 @@ export const scriptingRoutes = [
         async handler(req: Request, res: Response) {
             const { Engine } = await import('../engine');
             const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
-            const config = await Engine.getGameConfig(serverBaseUrl, serverBaseUrl, serverBaseUrl);
+            const assetLibraryBaseUrl = getAssetLibraryBaseUrl(serverBaseUrl);
+            const config = await Engine.getGameConfig(serverBaseUrl, assetLibraryBaseUrl, assetLibraryBaseUrl);
+            const cfg = config as any;
+            cfg.overrideSettings = cfg.overrideSettings || {};
+            cfg.overrideSettings.rendering = cfg.overrideSettings.rendering || {};
+            // 直接读磁盘上的 cocos.config.json（配置真相源），以最新物理碰撞分组覆盖缓存值。
+            // 原因同 design-resolution / modules 路由：Engine._config 只在 configuration:save 时刷新，
+            // 改分组后不读盘兜底，预览重载仍会按旧枚举构建 cc.PhysicsGroup，导致新分组在预览里不生效。
+            try {
+                const { configurationManager } = await import('../configuration');
+                const fse = await import('fs-extra');
+                const modules = await queryFreshEngineModules(Engine.getModules());
+                const customPipeline = modules.includes(CUSTOM_PIPELINE_MODULE);
+                cfg.overrideSettings.rendering.customPipeline = customPipeline;
+                if (customPipeline) {
+                    cfg.overrideSettings.rendering.effectSettingsPath = `${serverBaseUrl}/scripting/engine/effect-settings`;
+                }
+                const configPath = await configurationManager.getConfigPath();
+                if (await fse.pathExists(configPath)) {
+                    const json = await fse.readJSON(configPath);
+                    const diskGroups = json?.engine?.physicsConfig?.collisionGroups;
+                    if (Array.isArray(diskGroups)) {
+                        cfg.overrideSettings.physics = cfg.overrideSettings.physics || {};
+                        cfg.overrideSettings.physics.collisionGroups = diskGroups;
+                    }
+                }
+            } catch (error) {
+                console.debug('[game-config] read cocos.config.json collisionGroups failed, fallback to cached:', error);
+            }
             res.json(config);
+        },
+    },
+    {
+        // 轻量接口：返回当前工程的设计分辨率，供场景进程在每次打开场景前刷新 cc.view。
+        // Read the project-scope config file from disk through getConfigPath(), bypassing the main-process cache.
+        // configurationManager.reload() 的 load() 不会把新值同步回已注册的配置实例，
+        // Engine._config 也只在 configuration:save 时刷新，两者都可能慢一拍（改分辨率后要新建两次才生效的根因）。
+        url: '/scripting/engine/design-resolution',
+        async handler(req: Request, res: Response) {
+            const { Engine } = await import('../engine');
+            // 兜底：缓存/默认合并值
+            let dr = Engine.getConfig().designResolution as { width?: number; height?: number; fitWidth?: boolean; fitHeight?: boolean };
+            try {
+                const { configurationManager } = await import('../configuration');
+                const fse = await import('fs-extra');
+                const configPath = await configurationManager.getConfigPath();
+                if (await fse.pathExists(configPath)) {
+                    const json = await fse.readJSON(configPath);
+                    const disk = json?.engine?.designResolution;
+                    if (disk && typeof disk.width === 'number' && typeof disk.height === 'number') {
+                        // 以磁盘为准，缺失字段用缓存/默认补齐
+                        dr = { ...dr, ...disk };
+                    }
+                }
+            } catch (error) {
+                console.debug('[design-resolution] read project config failed, fallback to cached:', error);
+            }
+            res.json(dr);
         },
     },
     {
         url: '/scripting/engine/modules',
         async handler(req: Request, res: Response) {
             const { Engine } = await import('../engine');
-            const modules = Engine.getModules();
+            const modules = await queryFreshEngineModules(Engine.getModules());
             res.json(modules);
         },
     },
@@ -345,7 +541,7 @@ export const scriptingRoutes = [
                 if (packResource.type === 'json') {
                     res.json(packResource.json);
                 } else if (packResource.type === 'chunk') {
-                    res.sendFile(packResource.chunk.path);
+                    sendQuickPackChunk(res, packResource.chunk.path);
                 } else {
                     console.warn(`[Preview Server] Unknown pack resource type for ${fullUrl}:`, packResource);
                     next(new Error('Unknown pack resource type'));
@@ -365,7 +561,7 @@ export const scriptingRoutes = [
             try {
                 const packResource = await facet.loadPackResource(url);
                 if (packResource.type === 'chunk') {
-                    res.sendFile(packResource.chunk.path);
+                    sendQuickPackChunk(res, packResource.chunk.path);
                 } else if (packResource.type === 'json') {
                     res.json(packResource.json);
                 } else {

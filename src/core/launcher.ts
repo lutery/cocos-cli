@@ -6,6 +6,7 @@ import { startServer, getServerUrl } from '../server';
 import { GlobalConfig, GlobalPaths } from '../global';
 import scripting from './scripting';
 import { startupScene } from './scene';
+import { getExternalGamePreviewUrl } from './preview/game-preview-url';
 
 interface IPreviewStartOptions {
     port?: number;
@@ -103,7 +104,7 @@ export default class Launcher {
         await startServer(previewOptions.port);
 
         const { init, build } = await import('./builder');
-        await init(platform);
+        await init([platform]);
 
         const buildOptions: Partial<IBuildCommandOption> = {
             ...previewOptions.buildOptions,
@@ -150,7 +151,7 @@ export default class Launcher {
         await registerBrowserPreview(this.projectPath);
 
         const serverUrl = getServerUrl();
-        const url = options.scene ? `${serverUrl}/?scene=${encodeURIComponent(options.scene)}` : serverUrl;
+        const url = getExternalGamePreviewUrl(serverUrl, options.scene);
         console.log(`Game preview: ${url}`);
         await this.printPreviewScenes(serverUrl, options.scene);
         if (options.open !== false) {
@@ -228,14 +229,14 @@ export default class Launcher {
         await this.import();
         // 执行构建流程
         const { init, build } = await import('./builder');
-        await init(platform);
+        await init([platform]);
         return await build(platform, options);
     }
 
     static async make(platform: Platform, dest: string) {
         GlobalConfig.mode = 'simple';
         const { init, executeBuildStageTask } = await import('./builder');
-        await init(platform);
+        await init([platform]);
         return await executeBuildStageTask('command make', 'make', {
             platform,
             dest,
@@ -248,7 +249,7 @@ export default class Launcher {
         if (platform.startsWith('web')) {
             await startServer();
         }
-        await init(platform);
+        await init([platform]);
         return await executeBuildStageTask('command run', 'run', {
             platform,
             dest,
@@ -258,7 +259,7 @@ export default class Launcher {
     static async upload(platform: Platform, dest: string, accessToken?: string) {
         GlobalConfig.mode = 'simple';
         const { init, executeBuildStageTask } = await import('./builder');
-        await init(platform);
+        await init([platform]);
         return await executeBuildStageTask('command upload', 'upload', {
             platform,
             dest,
@@ -267,6 +268,16 @@ export default class Launcher {
                     accessToken,
                 },
             } : undefined,
+        });
+    }
+
+    static async publish(platform: Platform, dest: string) {
+        GlobalConfig.mode = 'simple';
+        const { init, executeBuildStageTask } = await import('./builder');
+        await init([platform]);
+        return await executeBuildStageTask('command publish', 'publish', {
+            platform,
+            dest,
         });
     }
 

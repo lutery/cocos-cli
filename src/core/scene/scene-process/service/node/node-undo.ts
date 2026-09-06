@@ -1,5 +1,5 @@
 import { Component, Node } from 'cc';
-import { NodeEventType, type IUndoRedoResult } from '../../../common';
+import { NodeEventType, type IUndoRedoResult, type IUndoScope } from '../../../common';
 import { Service } from '../core';
 import dumpUtil from '../dump';
 import nodeMgr from './index';
@@ -7,6 +7,7 @@ import { CreateNodeCommand } from '../undo/commands/create-node-command';
 import { SnapshotCommand, type ISnapshotAdapter } from '../undo/commands/snapshot-command';
 import type { INodeStructureCaptureTarget } from '../undo/commands/node-structure-command-utils';
 import { createUndoId, restoreNodeSnapshotDump, snapshotMapsEqual } from '../undo/commands/command-utils-shared';
+import { isRootNodePath } from '../../../../engine/editor-extends/manager/path-utils';
 
 const NodeMgr = EditorExtends.Node;
 
@@ -79,7 +80,7 @@ export class NodeUndoHelper {
 
     async recordNodeSnapshot(
         node: Node,
-        options: { label: string; type: string; record?: boolean },
+        options: { label: string; type: string; record?: boolean; scope?: IUndoScope },
         mutate: () => Promise<boolean>,
     ): Promise<boolean> {
         if (
@@ -102,7 +103,7 @@ export class NodeUndoHelper {
         }
 
         const after = this.captureNodeSnapshots([latestNode]);
-        this.pushNodeSnapshotCommand(options.type, options.label, before, after);
+        this.pushNodeSnapshotCommand(options.type, options.label, before, after, options.scope);
         return result;
     }
 
@@ -200,6 +201,7 @@ export class NodeUndoHelper {
         label: string,
         before: Map<string, INodeSnapshot>,
         after: Map<string, INodeSnapshot>,
+        scope: IUndoScope = { editorType: 'scene' },
     ): void {
         if (this.snapshotMapsEqual(before, after)) {
             return;
@@ -209,7 +211,7 @@ export class NodeUndoHelper {
             id: this._createUndoSnapshotId(type),
             label,
             type,
-            scope: { editorType: 'scene' },
+            scope,
             timestamp: Date.now(),
         }, before, after, this._createNodeSnapshotAdapter()));
     }
@@ -335,6 +337,7 @@ export class NodeUndoHelper {
             .filter((node): node is Node => !!node?.isValid)
             .map(node => ({ node, path: NodeMgr.getNodePath(node) }))
             .filter(target => !!target.path)
+            .filter(target => !this._containsExistingNode(target.node, beforeNodeUuids))
             .filter(target => !target.node.parent || !newUuids.has(target.node.parent.uuid))
             .sort((a, b) => a.node.getSiblingIndex() - b.node.getSiblingIndex());
     }
@@ -346,6 +349,15 @@ export class NodeUndoHelper {
             }
             return !targets.some(other => other.node !== target.node && target.node.isChildOf(other.node));
         });
+    }
+
+    private _containsExistingNode(node: Node, beforeNodeUuids: Set<string>): boolean {
+        for (const child of node.children ?? []) {
+            if (beforeNodeUuids.has(child.uuid) || this._containsExistingNode(child as Node, beforeNodeUuids)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private _captureChildOrderSnapshot(parent: Node): Map<string, INodeChildOrderSnapshot> {
@@ -412,8 +424,8 @@ export class NodeUndoHelper {
         }
         if (snapshot.parentPath) {
             try {
-                const byPath = snapshot.parentPath === '/'
-                    ? Service.Editor.getRootNode()
+                const byPath = isRootNodePath(snapshot.parentPath)
+                    ? Service.Editor.getRootNode() as Node | null
                     : NodeMgr.getNodeByPath(snapshot.parentPath) as Node | null;
                 return byPath?.isValid ? byPath : null;
             } catch (_error) {
@@ -578,7 +590,7 @@ export class NodeUndoHelper {
                 return byUuid;
             }
         }
-        if (snapshot.parentPath && snapshot.parentPath !== '/') {
+        if (snapshot.parentPath && !isRootNodePath(snapshot.parentPath)) {
             try {
                 const byPath = NodeMgr.getNodeByPath(snapshot.parentPath) as Node | null;
                 if (byPath?.isValid) {

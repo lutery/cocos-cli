@@ -4,6 +4,7 @@ const { nodeResolve } = require('@rollup/plugin-node-resolve');
 const virtual = require('@rollup/plugin-virtual');
 const json = require('@rollup/plugin-json');
 const path = require('path');
+const { createDeferredModuleSource } = require('./deferred-module-proxy');
 
 async function buildSceneBundle() {
     const workspaceDir = path.join(__dirname, '..');
@@ -23,8 +24,9 @@ async function buildSceneBundle() {
             virtual({
                 entry: `
                     import * as Bridge from '${bridgeFile}';
-                    const { startup, serviceManager, EditorExtends, Service } = Bridge;
-                    export { startup, serviceManager, EditorExtends, Service };
+                    // Keep the decorated ReferenceImage service reachable so Rollup retains its registration side effect.
+                    const { startup, serviceManager, EditorExtends, Service, ReferenceImageService } = Bridge;
+                    export { startup, serviceManager, EditorExtends, Service, ReferenceImageService };
                 `
             }),
             {
@@ -154,6 +156,9 @@ async function buildSceneBundle() {
                                 export var readJSON = _gfs.readJSON;
                                 export var readJson = _gfs.readJson;
                             `;
+                        }
+                        if (originalId === 'cc/mods-mgr') {
+                            return createDeferredModuleSource();
                         }
                         if (originalId === 'proper-lockfile') {
                             return `

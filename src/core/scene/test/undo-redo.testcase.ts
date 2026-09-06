@@ -13,6 +13,7 @@
  *   RemoveComponentCommand    | Component.remove              | 已覆盖
  *   RemoveNodeCommand         | Node.delete                   | 已覆盖
  *   snapshot setProperty      | Node.update                   | 已覆盖
+ *   scene property snapshot   | Node.setProperty('/')        | 已覆盖
  *   snapshot resetNode        | Node.reset (RPC)              | 已覆盖
  *   snapshot resetProperty    | Node.resetProperty (RPC)      | 已覆盖
  *   snapshot update null      | Node.updatePropertyFromNull   | 已覆盖
@@ -27,6 +28,7 @@
 
 import {
     ICreateByNodeTypeParams,
+    ICreateByAssetParams,
     IDeleteNodeParams,
     IAddComponentOptions,
     IRemoveComponentOptions,
@@ -36,6 +38,8 @@ import {
     NodeType,
     INodeInfo,
     ISetPropertyOptionsInfo,
+    IUndoOperationOptions,
+    PrefabState,
 } from '../common';
 import { Rpc } from '../main-process/rpc';
 import { sceneWorker } from '../main-process/scene-worker';
@@ -80,12 +84,12 @@ function toComponentInfo(dump: any): any {
 
 // Undo/Redo 是 scene-process service 命名空间，不是 main-process / MCP 代理。
 const Undo = {
-    undo: () => request('Undo', 'undo'),
-    redo: () => request('Redo', 'redo'),
+    undo: (options?: IUndoOperationOptions) => request('Undo', 'undo', options === undefined ? [] : [options]),
+    redo: (options?: IUndoOperationOptions) => request('Redo', 'redo', options === undefined ? [] : [options]),
     clearHistory: () => request('Undo', 'clearHistory'),
     isDirty: () => request<boolean>('Undo', 'isDirty'),
-    canUndo: () => request<boolean>('Undo', 'canUndo'),
-    canRedo: () => request<boolean>('Redo', 'canRedo'),
+    canUndo: (options?: IUndoOperationOptions) => request<boolean>('Undo', 'canUndo', options === undefined ? [] : [options]),
+    canRedo: (options?: IUndoOperationOptions) => request<boolean>('Redo', 'canRedo', options === undefined ? [] : [options]),
     markSaved: () => request('Undo', 'markSaved'),
     beginGroup: (options?: { label?: string }) => request('Undo', 'beginGroup', [options]),
     endGroup: (groupId: string) => request('Undo', 'endGroup', [groupId]),
@@ -99,6 +103,10 @@ const Undo = {
 const Node = {
     async createByType(params: ICreateByNodeTypeParams): Promise<INodeInfo | null> {
         const result = await request<any>('Node', 'createByType', [params]);
+        return result ? toNodeInfo(result) : null;
+    },
+    async createByAsset(params: ICreateByAssetParams): Promise<INodeInfo | null> {
+        const result = await request<any>('Node', 'createByAsset', [params]);
         return result ? toNodeInfo(result) : null;
     },
     delete: (params: IDeleteNodeParams) => request('Node', 'delete', [params]),
@@ -126,9 +134,13 @@ const Node = {
                 path: 'name',
                 dump: { ...nodeDump.name, value: params.name },
             }]);
-            const segments = currentPath.split('/');
-            segments[segments.length - 1] = params.name;
-            currentPath = segments.join('/');
+            const nodeUuid = nodeDump.uuid?.value;
+            if (nodeUuid) {
+                const realPath = await request<string>('Node', 'getPathByUuid', [nodeUuid]);
+                if (realPath) {
+                    currentPath = realPath;
+                }
+            }
         }
         return { path: currentPath };
     },
@@ -196,6 +208,18 @@ const Component = {
         return true;
     },
     reset: (params: { path: string }) => request<boolean>('Component', 'reset', [params]),
+    recalculateLODGroupBounds: (params: { path: string; record?: boolean }) => request<{
+        localBoundaryCenter: { x: number; y: number; z: number };
+        objectSize: number;
+    }>('Component', 'recalculateLODGroupBounds', [params]),
+    insertLOD: (params: { path: string; index: number; screenUsagePercentage?: number; record?: boolean }) => request<{
+        lodCount: number;
+        screenUsagePercentages: number[];
+    }>('Component', 'insertLOD', [params]),
+    eraseLOD: (params: { path: string; index: number; record?: boolean }) => request<{
+        lodCount: number;
+        screenUsagePercentages: number[];
+    }>('Component', 'eraseLOD', [params]),
 };
 
 const Prefab = {
@@ -236,6 +260,12 @@ async function queryComp(path: string) {
     }
 }
 
+function getLODLevels(component: any): unknown[] {
+    const lodProperty = component?.properties?.LODs ?? component?.properties?._LODs;
+    expect(lodProperty).toBeDefined();
+    return lodProperty.value;
+}
+
 async function safeDelete(path: string) {
     try {
         const node = await queryNode(path);
@@ -259,6 +289,53 @@ async function setNodeProperty(path: string, propPath: string, value: any, recor
         dump: { ...nodeDump[propPath], value },
         record,
     });
+}
+
+function readGlobalValue(sceneDump: any, path: string): any {
+    let current = sceneDump?._globals;
+    for (const key of path.split('.').slice(1)) {
+        current = current?.value && Object.prototype.hasOwnProperty.call(current.value, key)
+            ? current.value[key]
+            : current?.[key];
+    }
+    return current?.value ?? current;
+}
+
+function findGlobalScalarProperty(globals: Record<string, any>): { path: string; dump: any; value: boolean | number | string } | null {
+    const visit = (value: any, path: string): { path: string; dump: any; value: boolean | number | string } | null => {
+        if (!value || typeof value !== 'object') {
+            return null;
+        }
+        if ('type' in value && 'value' in value) {
+            if (value.readonly !== true && (typeof value.value === 'boolean' || typeof value.value === 'number' || typeof value.value === 'string')) {
+                return { path, dump: value, value: value.value };
+            }
+            if (value.value && typeof value.value === 'object' && !Array.isArray(value.value)) {
+                for (const [key, child] of Object.entries(value.value)) {
+                    const result = visit(child, `${path}.${key}`);
+                    if (result) {
+                        return result;
+                    }
+                }
+            }
+            return null;
+        }
+        for (const [key, child] of Object.entries(value)) {
+            const result = visit(child, path ? `${path}.${key}` : key);
+            if (result) {
+                return result;
+            }
+        }
+        return null;
+    };
+
+    for (const [key, value] of Object.entries(globals)) {
+        const result = visit(value, `_globals.${key}`);
+        if (result) {
+            return result;
+        }
+    }
+    return null;
 }
 
 async function readAssetContent(dbURL: string): Promise<string> {
@@ -374,14 +451,17 @@ describe('Undo/Redo 集成测试', () => {
     // ========================================================================
     describe('CreateNode', () => {
         const path = 'UndoCreateNode';
+        const buttonName = 'UndoCreateButton';
 
         beforeEach(async () => {
             await safeDelete(path);
+            await safeDelete(`Canvas/${buttonName}`);
             await Undo.clearHistory();
         });
 
         afterEach(async () => {
             await safeDelete(path);
+            await safeDelete(`Canvas/${buttonName}`);
             await Undo.clearHistory();
         });
 
@@ -404,6 +484,19 @@ describe('Undo/Redo 集成测试', () => {
             expect(await queryNode(path)).not.toBeNull();
             expect(await Undo.canUndo()).toBe(true);
             expect(await Undo.canRedo()).toBe(false);
+        });
+
+        it('create Button by node type unlinks prefab metadata from the created node', async () => {
+            const created = await Node.createByType({ path: '/', name: buttonName, nodeType: NodeType.BUTTON });
+            expect(created).not.toBeNull();
+
+            const dump = await queryNodeDump(created!.path);
+
+            expect(dump.__prefab__).toBeNull();
+            expect((dump.__comps__ ?? []).map((comp: any) => comp.__compPrefab__)).toEqual(
+                expect.arrayContaining([null]),
+            );
+            expect((dump.__comps__ ?? []).every((comp: any) => comp.__compPrefab__ === null)).toBe(true);
         });
     });
 
@@ -500,9 +593,11 @@ describe('Undo/Redo 集成测试', () => {
     describe('Component setProperty (snapshot)', () => {
         const path = 'UndoComponentSetProperty';
         const compPath = `${path}/cc.Label`;
+        const spriteSplashPath = 'UndoSpriteSplashSetProperty';
 
         beforeEach(async () => {
             await safeDelete(path);
+            await safeDelete(spriteSplashPath);
             await Node.createByType({ path, nodeType: NodeType.EMPTY });
             await Component.add({ nodePath: path, component: 'cc.Label' });
             await Undo.clearHistory();
@@ -510,6 +605,7 @@ describe('Undo/Redo 集成测试', () => {
 
         afterEach(async () => {
             await safeDelete(path);
+            await safeDelete(spriteSplashPath);
             await Undo.clearHistory();
         });
 
@@ -531,6 +627,40 @@ describe('Undo/Redo 集成测试', () => {
             const redoResult = await Undo.redo();
             expectUndoSuccess(redoResult);
             expect((await queryComp(compPath))!.properties.string.value).toBe('undo-redo-label');
+        });
+
+        it('setProperty undo restores SpriteSplash default SpriteFrame instead of null', async () => {
+            const created = await Node.createByType({ path: '/', name: spriteSplashPath, nodeType: NodeType.SPRITE_SPLASH });
+            if (!created) {
+                throw new Error('Failed to create SpriteSplash test node.');
+            }
+            const spriteSplashCompPath = `${created.path}/cc.Sprite`;
+            const before = await queryComp(spriteSplashCompPath);
+            const originalUuid = before?.properties.spriteFrame?.value?.uuid;
+            expect(typeof originalUuid).toBe('string');
+            expect(originalUuid).not.toBe('');
+
+            const spriteFrameAssets = await assetManager.queryAssetInfos({ pattern: 'db://internal/default_ui/default_editbox_bg.png/spriteFrame' });
+            if (spriteFrameAssets.length === 0 || !spriteFrameAssets[0].uuid) {
+                throw new Error('Failed to query internal SpriteFrame test asset.');
+            }
+            const nextUuid = spriteFrameAssets[0].uuid;
+            expect(nextUuid).not.toBe(originalUuid);
+
+            expect(await Component.setProperty({
+                componentPath: spriteSplashCompPath,
+                properties: { spriteFrame: { uuid: nextUuid } },
+            })).toBe(true);
+            expect((await queryComp(spriteSplashCompPath))!.properties.spriteFrame.value.uuid).toBe(nextUuid);
+
+            expect(await Undo.undo({ scope: { editorType: 'animation', mode: 'animation' } })).toMatchObject({
+                success: false,
+                reason: 'Cannot undo',
+            });
+            expect((await queryComp(spriteSplashCompPath))!.properties.spriteFrame.value.uuid).toBe(nextUuid);
+
+            expectUndoSuccess(await Undo.undo());
+            expect((await queryComp(spriteSplashCompPath))!.properties.spriteFrame.value.uuid).toBe(originalUuid);
         });
     });
 
@@ -615,6 +745,79 @@ describe('Undo/Redo 集成测试', () => {
     // ========================================================================
     // 基于快照：通过 Node.update 设置属性
     // ========================================================================
+    describe('scene snapshot properties', () => {
+        afterEach(async () => {
+            if (await Undo.canUndo()) {
+                await Undo.undo();
+            }
+            await Undo.clearHistory();
+        });
+
+        it('undo restores a top-level scene property through generic snapshot restore', async () => {
+            const sceneDump = await queryNodeDump('/');
+            const propertyDump = sceneDump?.autoReleaseAssets;
+            expect(propertyDump).toBeDefined();
+            if (!propertyDump) {
+                return;
+            }
+
+            const originalValue = propertyDump.value;
+            const nextValue = !originalValue;
+            expect(await Node.setProperty({
+                nodePath: '/',
+                path: 'autoReleaseAssets',
+                dump: { ...propertyDump, value: nextValue },
+            })).toBe(true);
+            expect((await queryNodeDump('/')).autoReleaseAssets.value).toBe(nextValue);
+
+            expectUndoSuccess(await Undo.undo());
+            expect((await queryNodeDump('/')).autoReleaseAssets.value).toBe(originalValue);
+
+            expectUndoSuccess(await Undo.redo());
+            expect((await queryNodeDump('/')).autoReleaseAssets.value).toBe(nextValue);
+        });
+    });
+
+    describe('scene _globals setProperty (snapshot)', () => {
+        afterEach(async () => {
+            if (await Undo.canUndo()) {
+                await Undo.undo();
+            }
+            await Undo.clearHistory();
+        });
+
+        it('undo restores a changed scene global and redo reapplies it', async () => {
+            const sceneDump = await queryNodeDump('/');
+            const globalProperty = findGlobalScalarProperty(sceneDump?._globals ?? {});
+            expect(globalProperty).not.toBeNull();
+            if (!globalProperty) {
+                return;
+            }
+
+            const nextValue = typeof globalProperty.value === 'boolean'
+                ? !globalProperty.value
+                : typeof globalProperty.value === 'number'
+                    ? globalProperty.value + 1
+                    : `${globalProperty.value}-undo`;
+
+            expect(await Node.setProperty({
+                nodePath: '/',
+                path: globalProperty.path,
+                dump: { ...globalProperty.dump, value: nextValue },
+            })).toBe(true);
+            expect(readGlobalValue(await queryNodeDump('/'), globalProperty.path)).toBe(nextValue);
+            expect(await Undo.canUndo()).toBe(true);
+
+            expectUndoSuccess(await Undo.undo());
+            const afterUndo = await queryNodeDump('/');
+            expect(readGlobalValue(afterUndo, globalProperty.path)).toBe(globalProperty.value);
+
+            expectUndoSuccess(await Undo.redo());
+            const afterRedo = await queryNodeDump('/');
+            expect(readGlobalValue(afterRedo, globalProperty.path)).toBe(nextValue);
+        });
+    });
+
     describe('setProperty (snapshot)', () => {
         const path = 'UndoSetProp';
 
@@ -666,16 +869,48 @@ describe('Undo/Redo 集成测试', () => {
 
         it('update name, undo restores original name, redo reapplies', async () => {
             const updateParams: IUpdateNodeParams = { path, name: 'RenamedNode' };
-            await Node.update(updateParams);
-            const renamedPath = `${path.slice(0, path.lastIndexOf('/') + 1)}RenamedNode`;
+            const updateResult = await Node.update(updateParams);
+            const renamedPath = updateResult.path;
             expect(await queryNode(renamedPath)).not.toBeNull();
 
             await Undo.undo();
             expect(await queryNode(path)).not.toBeNull();
-            expect((await queryNode(path))!.name).toBe(path.split('/').pop());
+            const originalName = path.split('/').pop();
+            expect((await queryNode(path))!.name).toBe(originalName);
 
             await Undo.redo();
             expect(await queryNode(renamedPath)).not.toBeNull();
+        });
+
+        it('conflicting rename keeps the display name and restores the correct paths through undo/redo', async () => {
+            const conflictingPath = 'UndoConflictName';
+            let renamedPath = '';
+            await Node.createByType({ path: conflictingPath, nodeType: NodeType.EMPTY });
+            await Undo.clearHistory();
+
+            try {
+                const updateResult = await Node.update({ path, name: conflictingPath });
+                renamedPath = updateResult.path;
+
+                expect(renamedPath).not.toBe(conflictingPath);
+                expect((await queryNode(renamedPath))?.name).toBe(conflictingPath);
+                expect((await queryNode(conflictingPath))?.name).toBe(conflictingPath);
+
+                expectUndoSuccess(await Undo.undo());
+                expect((await queryNode(path))?.name).toBe(path);
+                expect(await queryNode(renamedPath)).toBeNull();
+                expect(await queryNode(conflictingPath)).not.toBeNull();
+
+                expectUndoSuccess(await Undo.redo());
+                expect((await queryNode(renamedPath))?.name).toBe(conflictingPath);
+                expect(await queryNode(path)).toBeNull();
+                expect(await queryNode(conflictingPath)).not.toBeNull();
+            } finally {
+                if (renamedPath) {
+                    await safeDelete(renamedPath);
+                }
+                await safeDelete(conflictingPath);
+            }
         });
     });
 
@@ -819,6 +1054,114 @@ describe('Undo/Redo 集成测试', () => {
             const redoResult = await Undo.redo();
             expectUndoSuccess(redoResult);
             expect((await queryComp(compPath))!.properties.string.value).toBe('label');
+        });
+    });
+
+    // ========================================================================
+    // LODGroup 包围盒重算（快照）
+    // ========================================================================
+    describe('LODGroup recalculate bounds (snapshot)', () => {
+        const path = 'UndoRecalculateLODGroupNode';
+        const compPath = `${path}/cc.LODGroup`;
+
+        beforeEach(async () => {
+            await Node.createByType({ path, nodeType: NodeType.EMPTY });
+            await Component.add({ nodePath: path, component: 'cc.LODGroup' });
+            await Component.setProperty({
+                componentPath: compPath,
+                properties: { _objectSize: 42 },
+                record: false,
+            });
+            await Undo.clearHistory();
+        });
+
+        afterEach(async () => {
+            await safeDelete(path);
+            await Undo.clearHistory();
+        });
+
+        it('recalculate pushes one snapshot and supports undo/redo', async () => {
+            expect((await queryComp(compPath))!.properties._objectSize.value).toBe(42);
+
+            const bounds = await Component.recalculateLODGroupBounds({ path: compPath });
+            expect(bounds).toEqual({
+                localBoundaryCenter: { x: 0, y: 0, z: 0 },
+                objectSize: 0,
+            });
+            expect((await queryComp(compPath))!.properties._objectSize.value).toBe(0);
+            expect(await Undo.canUndo()).toBe(true);
+
+            const undoResult = await Undo.undo();
+            expectUndoSuccess(undoResult);
+            expect((await queryComp(compPath))!.properties._objectSize.value).toBe(42);
+
+            const redoResult = await Undo.redo();
+            expectUndoSuccess(redoResult);
+            expect((await queryComp(compPath))!.properties._objectSize.value).toBe(0);
+        });
+
+        it('record=false does not push an undo snapshot', async () => {
+            const bounds = await Component.recalculateLODGroupBounds({
+                path: compPath,
+                record: false,
+            });
+
+            expect(bounds.objectSize).toBe(0);
+            expect(await Undo.canUndo()).toBe(false);
+        });
+    });
+
+    // ========================================================================
+    // LODGroup 层级增删（快照）
+    // ========================================================================
+    describe('LODGroup level mutations (snapshot)', () => {
+        const path = 'UndoLODGroupLevelsNode';
+        const compPath = `${path}/cc.LODGroup`;
+
+        beforeEach(async () => {
+            await Node.createByType({ path, nodeType: NodeType.EMPTY });
+            await Component.add({ nodePath: path, component: 'cc.LODGroup' });
+            await Undo.clearHistory();
+        });
+
+        afterEach(async () => {
+            await safeDelete(path);
+            await Undo.clearHistory();
+        });
+
+        it('insert pushes one snapshot and supports undo/redo', async () => {
+            const inserted = await Component.insertLOD({ path: compPath, index: 0 });
+            expect(inserted.lodCount).toBe(4);
+            expect(inserted.screenUsagePercentages).toHaveLength(4);
+            expect(getLODLevels(await queryComp(compPath))).toHaveLength(4);
+            expect(await Undo.canUndo()).toBe(true);
+
+            expectUndoSuccess(await Undo.undo());
+            expect(getLODLevels(await queryComp(compPath))).toHaveLength(3);
+
+            expectUndoSuccess(await Undo.redo());
+            expect(getLODLevels(await queryComp(compPath))).toHaveLength(4);
+        });
+
+        it('erase pushes one snapshot and supports undo', async () => {
+            await Component.insertLOD({ path: compPath, index: 0, record: false });
+            await Component.insertLOD({ path: compPath, index: 1, record: false });
+            await Undo.clearHistory();
+
+            const erased = await Component.eraseLOD({ path: compPath, index: 1 });
+            expect(erased.lodCount).toBe(4);
+            expect(getLODLevels(await queryComp(compPath))).toHaveLength(4);
+            expect(await Undo.canUndo()).toBe(true);
+
+            expectUndoSuccess(await Undo.undo());
+            expect(getLODLevels(await queryComp(compPath))).toHaveLength(5);
+        });
+
+        it('record=false does not push an undo snapshot', async () => {
+            await Component.insertLOD({ path: compPath, index: 0, record: false });
+
+            expect(getLODLevels(await queryComp(compPath))).toHaveLength(4);
+            expect(await Undo.canUndo()).toBe(false);
         });
     });
 
@@ -1341,11 +1684,17 @@ describe('Undo/Redo 集成测试', () => {
         const unpackPath = 'UndoPrefabUnpack';
         const unlinkPath = 'UndoPrefabUnlink';
         const revertPath = 'UndoPrefabRevert';
+        const mountedButtonRootPath = 'UndoPrefabMountedButtonRoot';
+        const mountedButtonName = 'UndoPrefabMountedButton';
+        const deletePrefabAssetPath = 'UndoPrefabDeleteAsset';
+        const deletePrefabInstanceName = 'UndoPrefabDeleteInstance';
         const createURL = `${SceneTestEnv.targetDirectoryURL}/UndoPrefabCreate.prefab`;
         const applyURL = `${SceneTestEnv.targetDirectoryURL}/UndoPrefabApply.prefab`;
         const unpackURL = `${SceneTestEnv.targetDirectoryURL}/UndoPrefabUnpack.prefab`;
         const unlinkURL = `${SceneTestEnv.targetDirectoryURL}/UndoPrefabUnlink.prefab`;
         const revertURL = `${SceneTestEnv.targetDirectoryURL}/UndoPrefabRevert.prefab`;
+        const mountedButtonURL = `${SceneTestEnv.targetDirectoryURL}/${mountedButtonRootPath}.prefab`;
+        const deletePrefabURL = `${SceneTestEnv.targetDirectoryURL}/${deletePrefabAssetPath}.prefab`;
 
         afterEach(async () => {
             await safeDelete(createPath);
@@ -1353,6 +1702,9 @@ describe('Undo/Redo 集成测试', () => {
             await safeDelete(unpackPath);
             await safeDelete(unlinkPath);
             await safeDelete(revertPath);
+            await safeDelete(mountedButtonRootPath);
+            await safeDelete(deletePrefabAssetPath);
+            await safeDelete(deletePrefabInstanceName);
             await Undo.clearHistory();
         });
 
@@ -1507,6 +1859,82 @@ describe('Undo/Redo 集成测试', () => {
             expect(await Undo.canUndo()).toBe(true);
             const reverted = await queryNode(revertPath);
             expect(reverted?.properties.scale).toEqual({ x: 1, y: 1, z: 1 });
+        });
+
+        it('delete undo restores a prefab instance without losing its prefab asset', async () => {
+            const source = await Node.createByType({ path: '/', name: deletePrefabAssetPath, nodeType: NodeType.EMPTY });
+            expect(source).not.toBeNull();
+            await Prefab.createPrefabFromNode({
+                nodePath: source!.path,
+                dbURL: deletePrefabURL,
+                overwrite: true,
+            });
+            const created = await Node.createByAsset({
+                dbURL: deletePrefabURL,
+                path: '/',
+                name: deletePrefabInstanceName,
+            });
+            expect(created).not.toBeNull();
+            await expectPrefabInstance(created!.path, true, 'before deleting prefab instance');
+            const createdTree = await Node.queryNodeTree({ path: created!.path });
+            expect(createdTree.prefab.state).toBe(PrefabState.PrefabInstance);
+            await Undo.clearHistory();
+
+            const ok = await Node.delete({ path: created!.path, keepWorldTransform: false });
+            expect(ok).not.toBeNull();
+            expect(await queryNode(created!.path)).toBeNull();
+
+            const undoResult = await Undo.undo();
+            expectUndoSuccess(undoResult);
+
+            await expectPrefabInstance(created!.path, true, 'after undo deleting prefab instance');
+            const restoredTree = await Node.queryNodeTree({ path: created!.path });
+            expect(restoredTree.prefab.state).toBe(PrefabState.PrefabInstance);
+        });
+
+        it('mounted Button created under a prefab instance stays a plain added child after delete undo', async () => {
+            const root = await Node.createByType({ path: '/', name: mountedButtonRootPath, nodeType: NodeType.EMPTY });
+            expect(root).not.toBeNull();
+            const rootPath = root!.path;
+            await Component.add({ nodePath: rootPath, component: 'cc.Canvas' });
+            await Prefab.createPrefabFromNode({
+                nodePath: rootPath,
+                dbURL: mountedButtonURL,
+                overwrite: true,
+            });
+            await expectPrefabInstance(rootPath, true, 'before creating mounted button');
+            await Undo.clearHistory();
+
+            const created = await Node.createByType({
+                path: rootPath,
+                name: mountedButtonName,
+                nodeType: NodeType.BUTTON,
+            });
+            expect(created).not.toBeNull();
+
+            const createdDump = await queryNodeDump(created!.path);
+            const createdTree = await Node.queryNodeTree({ path: created!.path });
+            expect(createdDump.__prefab__).toBeNull();
+            expect((createdDump.__comps__ ?? []).every((comp: any) => comp.__compPrefab__ === null)).toBe(true);
+            expect(createdDump.mountedRoot).toBeTruthy();
+            expect(createdTree.prefab.state).toBe(PrefabState.NotAPrefab);
+            expect(createdTree.prefab.isAddedChild).toBe(true);
+
+            await Undo.clearHistory();
+            const ok = await Node.delete({ path: created!.path, keepWorldTransform: false });
+            expect(ok).not.toBeNull();
+            expect(await queryNode(created!.path)).toBeNull();
+
+            const undoResult = await Undo.undo();
+            expectUndoSuccess(undoResult);
+
+            const restoredDump = await queryNodeDump(created!.path);
+            const restoredTree = await Node.queryNodeTree({ path: created!.path });
+            expect(restoredDump.__prefab__).toBeNull();
+            expect((restoredDump.__comps__ ?? []).every((comp: any) => comp.__compPrefab__ === null)).toBe(true);
+            expect(restoredDump.mountedRoot).toBeTruthy();
+            expect(restoredTree.prefab.state).toBe(PrefabState.NotAPrefab);
+            expect(restoredTree.prefab.isAddedChild).toBe(true);
         });
     });
 

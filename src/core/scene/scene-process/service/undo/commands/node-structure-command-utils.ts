@@ -1,7 +1,9 @@
-import { editorExtrasTag, Node } from 'cc';
+import { Node } from 'cc';
 import { NodeEventType, type IUndoCommandMeta, type IUndoRedoResult } from '../../../../common';
 import nodeMgr from '../../node/index';
 import { editorPrefabUtils } from '../../prefab/prefab-editor-utils';
+import { nodeOperation } from '../../prefab/node';
+import { sceneUtils } from '../../scene/utils';
 import {
     createUndoId,
     success,
@@ -27,6 +29,7 @@ export interface INodeStructureSnapshot {
     parentPath: string;
     siblingIndex: number;
     serializedJson: string;
+    prefabAssetUuid?: string;
     /** 子树 uuid 树（前序遍历的树根），用于 deserialize 后修复整棵树的 uuid */
     uuidTree: INodeUuidSnapshot;
 }
@@ -79,45 +82,16 @@ export function captureNodeStructureSnapshot(
         parentPath: parent ? getNodePath(parent) : '/',
         siblingIndex: node.getSiblingIndex(),
         serializedJson,
+        prefabAssetUuid: getPrefabAssetUuid(node),
         uuidTree: captureUuidTree(node),
     };
 }
 
 function serializeNodeStructure(node: Node, serialization: NodeStructureSerialization): string {
-    const serialized = shouldSerializeAsPrefab(node, serialization)
+    const serialized = serialization === 'prefab'
         ? editorPrefabUtils.serialize(node)
-        : EditorExtends.serialize(node);
+        : EditorExtends.serialize(node, { reserveContentsForSyncablePrefab: true });
     return typeof serialized === 'string' ? serialized : JSON.stringify(serialized);
-}
-
-function shouldSerializeAsPrefab(node: Node, serialization: NodeStructureSerialization): boolean {
-    if (serialization === 'prefab') {
-        return true;
-    }
-    if (serialization === 'node') {
-        return false;
-    }
-    return hasPrefabData(node);
-}
-
-function hasPrefabData(node: Node): boolean {
-    if (node['_prefab']) {
-        return true;
-    }
-
-    if (hasMountedRoot(node)) {
-        return true;
-    }
-
-    if ((node.components ?? []).some(component => component.__prefab || hasMountedRoot(component))) {
-        return true;
-    }
-
-    return (node.children ?? []).some(child => hasPrefabData(child));
-}
-
-function hasMountedRoot(target: unknown): boolean {
-    return Boolean((target as any)?.[editorExtrasTag]?.mountedRoot);
 }
 
 function captureUuidTree(node: Node): INodeUuidSnapshot {
@@ -153,11 +127,63 @@ export async function restoreNodeStructureSnapshot(snapshot: INodeStructureSnaps
         }
         restoreSubtreeUuids(restoredNode, snapshot.uuidTree);
 
+        // Relink after addChild — setParent triggers engine-side prefab
+        // processing that can clear _prefab.asset set before the add.
+        await relinkPrefabAsset(restoredNode, snapshot);
+
         nodeMgr.emit('node:add', restoredNode);
         nodeMgr.emit('node:change', parent, { source: 'undo', type: NodeEventType.CHILD_CHANGED });
         return success(meta);
     } catch (error) {
         return failure(meta, error instanceof Error ? error.message : String(error));
+    }
+}
+
+function getPrefabAssetUuid(node: Node): string | undefined {
+    const prefabInfo = node['_prefab'];
+    if (!prefabInfo?.instance) {
+        return undefined;
+    }
+
+    const asset = prefabInfo.asset as { _uuid?: string; uuid?: string } | undefined;
+    return asset?._uuid || asset?.uuid || undefined;
+}
+
+async function relinkPrefabAsset(node: Node, snapshot: INodeStructureSnapshot): Promise<void> {
+    if (!snapshot.prefabAssetUuid) {
+        return;
+    }
+
+    try {
+        const asset = await sceneUtils.loadAny(snapshot.prefabAssetUuid);
+        setPrefabAssetOnTree(node, asset);
+        nodeOperation.checkToAddPrefabAssetMap(node);
+    } catch (_error) {
+        // best-effort: asset may have been removed from the project
+    }
+}
+
+function setPrefabAssetOnTree(node: Node, asset: any): void {
+    const prefabInfo = (node as any)['_prefab'];
+    if (prefabInfo) {
+        prefabInfo.asset = asset;
+    }
+    for (const child of node.children ?? []) {
+        setPrefabAssetOnChildren(child, asset);
+    }
+}
+
+function setPrefabAssetOnChildren(node: Node, asset: any): void {
+    const prefabInfo = (node as any)['_prefab'];
+    if (!prefabInfo) {
+        return;
+    }
+    if (prefabInfo.instance) {
+        return;
+    }
+    prefabInfo.asset = asset;
+    for (const child of node.children ?? []) {
+        setPrefabAssetOnChildren(child, asset);
     }
 }
 
@@ -205,7 +231,7 @@ function findParent(snapshot: INodeStructureSnapshot): Node | null {
         }
     }
 
-    if (snapshot.parentPath && snapshot.parentPath !== '/') {
+    if (snapshot.parentPath) {
         try {
             const byPath = editorNode?.getNodeByPath?.(snapshot.parentPath) as Node | null;
             if (byPath) {

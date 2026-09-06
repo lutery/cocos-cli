@@ -3,7 +3,6 @@
  */
 
 import { basename, isAbsolute, join } from 'path';
-import { pathExists, readJSON } from 'fs-extra';
 import { BundleCompressionTypes } from './bundle-utils';
 import { NATIVE_PLATFORM } from './platforms-options';
 import { IBuildSceneItem, IBuildTaskItemJSON, IBuildTaskOption } from '../@types';
@@ -14,8 +13,8 @@ import Utils from '../../base/utils';
 import assetManager from '../../assets/manager/asset';
 import { Engine } from '../../engine';
 import builderConfig from './builder-config';
+import { cloneConfigValue } from './utils';
 import { validatorManager } from './validator-manager';
-import { CocosConfigLoader } from '../../configuration/migration/cocos-config-loader';
 interface ModuleConfig {
     match: (module: string) => boolean;
     default: string | boolean;
@@ -370,7 +369,7 @@ export function checkBundleCompressionSetting(value: BundleCompressionType, supp
  */
 export function handleOverwriteProjectSettings(options: IBuildTaskOption) {
     const overwriteModules = options.overwriteProjectSettings?.includeModules;
-    let includeModules = options.includeModules;
+    let includeModules = options.includeModules ? [...options.includeModules] : options.includeModules;
     if (includeModules && overwriteModules && includeModules.length) {
         for (const module in overwriteModules) {
             if (overwriteModules[module] !== 'inherit-project-setting') {
@@ -399,25 +398,63 @@ export function handleOverwriteProjectSettings(options: IBuildTaskOption) {
     }
 }
 
-export async function checkProjectSetting(options: IInternalBuildOptions | IInternalBundleBuildOptions) {
-    options.engineInfo = options.engineInfo || Engine.getInfo();
+function resolveIncludeModulesFromEngineConfig(
+    engineConfig: ReturnType<typeof Engine.getConfig> & {
+        configs?: Record<string, { includeModules?: string[] }>;
+        globalConfigKey?: string;
+    },
+    engineModulesConfigKey?: string,
+) {
+    if (engineModulesConfigKey) {
+        const includeModules = engineConfig.configs?.[engineModulesConfigKey]?.includeModules;
+        if (!includeModules?.length) {
+            throw new Error(`Invalid engineModulesConfigKey: ${engineModulesConfigKey}`);
+        }
+        return [...includeModules];
+    }
 
-    const { designResolution, renderPipeline, physicsConfig, customLayers, sortingLayers, macroConfig, includeModules } = Engine.getConfig();
+    if (engineConfig.includeModules?.length) {
+        return [...engineConfig.includeModules];
+    }
+
+    const selectedConfigKey = engineConfig.globalConfigKey || Object.keys(engineConfig.configs || {})[0];
+    const includeModules = selectedConfigKey ? engineConfig.configs?.[selectedConfigKey]?.includeModules : undefined;
+    return includeModules?.length ? [...includeModules] : [];
+}
+
+/**
+ * Fill `options.includeModules` from the project engine config (settings/cocos.config.json) when it is empty,
+ * so the preview path produces the same `includeModules` as a formal build (checkProjectSetting).
+ * Does not override an already non-empty `includeModules`.
+ */
+export async function fillIncludeModulesFromProjectConfig(
+    options: { includeModules?: string[]; engineModulesConfigKey?: string },
+): Promise<void> {
+    if (!options.includeModules || !options.includeModules.length) {
+        options.includeModules = resolveIncludeModulesFromEngineConfig(Engine.getConfig(), options.engineModulesConfigKey);
+    }
+}
+
+export async function checkProjectSetting(options: IInternalBuildOptions | IInternalBundleBuildOptions) {
+    options.engineInfo = options.engineInfo || cloneConfigValue(Engine.getInfo());
+
+    const engineConfig = Engine.getConfig();
+    const { designResolution, renderPipeline, physicsConfig, customLayers, sortingLayers, macroConfig } = engineConfig;
     // 默认 Canvas 设置
     if (!options.designResolution) {
-        options.designResolution = designResolution;
+        options.designResolution = cloneConfigValue(designResolution);
     }
 
     // renderPipeline
     if (!options.renderPipeline) {
         if (renderPipeline) {
-            options.renderPipeline = renderPipeline;
+            options.renderPipeline = cloneConfigValue(renderPipeline);
         }
     }
 
     // physicsConfig
     if (!options.physicsConfig) {
-        options.physicsConfig = physicsConfig;
+        options.physicsConfig = cloneConfigValue(physicsConfig);
         if (!options.physicsConfig.defaultMaterial) {
             options.physicsConfig.defaultMaterial = 'ba21476f-2866-4f81-9c4d-6e359316e448';
         }
@@ -425,25 +462,25 @@ export async function checkProjectSetting(options: IInternalBuildOptions | IInte
 
     // customLayers
     if (!options.customLayers) {
-        options.customLayers = customLayers;
+        options.customLayers = cloneConfigValue(customLayers);
     }
 
     // sortingLayers
     if (!options.sortingLayers) {
         if (sortingLayers) {
-            options.sortingLayers = sortingLayers;
+            options.sortingLayers = cloneConfigValue(sortingLayers);
         }
     }
 
     // macro 配置
     if (!options.macroConfig) {
         if (macroConfig) {
-            options.macroConfig = macroConfig;
+            options.macroConfig = cloneConfigValue(macroConfig);
         }
     }
 
     if (!options.includeModules || !options.includeModules.length) {
-        options.includeModules = includeModules;
+        options.includeModules = resolveIncludeModulesFromEngineConfig(engineConfig, options.engineModulesConfigKey);
     }
 
     // 确保 includeModules 中包含 'debug-renderer'
@@ -462,76 +499,8 @@ export async function checkProjectSetting(options: IInternalBuildOptions | IInte
     }
 
     if (!options.splashScreen) {
-        options.splashScreen = Engine.getConfig().splashScreen;
+        options.splashScreen = cloneConfigValue(engineConfig.splashScreen);
     }
 
 }
 
-function getSelectedIncludeModulesFromEngineConfig(engineConfig: Record<string, any> | undefined): string[] | undefined {
-    if (!engineConfig || typeof engineConfig !== 'object') {
-        return undefined;
-    }
-
-    if (Array.isArray(engineConfig.includeModules) && engineConfig.includeModules.length) {
-        return [...engineConfig.includeModules];
-    }
-
-    const configs = engineConfig.configs || engineConfig.modules?.configs;
-    if (!configs || typeof configs !== 'object') {
-        return undefined;
-    }
-
-    const globalConfigKey = engineConfig.globalConfigKey || engineConfig.modules?.globalConfigKey || Object.keys(configs)[0];
-    const includeModules = globalConfigKey ? configs[globalConfigKey]?.includeModules : undefined;
-    return Array.isArray(includeModules) && includeModules.length ? [...includeModules] : undefined;
-}
-
-async function loadIncludeModulesFromCocosConfig(): Promise<string[] | undefined> {
-    const configPath = join(builderConfig.projectRoot, 'cocos.config.json');
-    console.log(`[Build] 尝试从 cocos.config.json 中加载引擎配置: ${configPath}`);
-    if (!(await pathExists(configPath))) {
-        return undefined;
-    }
-
-    try {
-        const config = await readJSON(configPath);
-        return getSelectedIncludeModulesFromEngineConfig(config?.engine);
-    } catch (error) {
-        console.warn(`[Build] 加载 cocos.config.json 中的引擎配置失败，将尝试旧配置: ${error}`);
-        return undefined;
-    }
-}
-
-/**
- * 从项目配置中补充 includeModules
- * 优先使用项目根目录 cocos.config.json 中的 engine 配置；不存在时回退到 settings/v2/packages/engine.json
- * @param options 构建选项
- */
-export async function fillIncludeModulesFromProjectConfig(options: IInternalBuildOptions | IInternalBundleBuildOptions | IBuildTaskOption): Promise<void> {
-    if (!options.includeModules || !options.includeModules.length) {
-        try {
-            const includeModules = await loadIncludeModulesFromCocosConfig();
-            if (includeModules?.length) {
-                console.log(`[Build] 从 cocos.config.json 中补充 includeModules: ${JSON.stringify(includeModules)}`);
-                options.includeModules = includeModules;
-                return;
-            }
-
-            const projectPath = builderConfig.projectRoot;
-            const configLoader = new CocosConfigLoader();
-            configLoader.initialize(projectPath);
-            const engineConfig = await configLoader.loadConfig('project', 'engine');
-            
-            if (engineConfig?.modules?.configs) {
-                const configs = engineConfig.modules.configs;
-                const globalConfigKey = engineConfig.modules.globalConfigKey || Object.keys(configs)[0];
-                
-                if (globalConfigKey && configs[globalConfigKey]?.includeModules) {
-                    options.includeModules = configs[globalConfigKey].includeModules;
-                }
-            }
-        } catch (error) {
-            console.warn(`[Build] 加载项目引擎配置失败，将使用默认配置: ${error}`);
-        }
-    }
-}

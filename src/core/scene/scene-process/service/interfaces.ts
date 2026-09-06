@@ -27,8 +27,13 @@ import {
     IGizmoService,
     IPublicSceneViewService,
     ISceneViewService,
+    IPublicPreviewService,
+    IPreviewService,
     IPublicUIService,
     IUIService,
+    IAnimationService,
+    IPublicReferenceImageService,
+    IReferenceImageService,
 } from '../../common';
 
 /**
@@ -49,7 +54,9 @@ export interface IPublicServiceManager {
     Camera: IPublicCameraService,
     Gizmo: IPublicGizmoService,
     SceneView: IPublicSceneViewService,
+    Preview: IPublicPreviewService,
     UI: IPublicUIService,
+    ReferenceImage: IPublicReferenceImageService,
 }
 
 export interface IServiceManager {
@@ -59,6 +66,7 @@ export interface IServiceManager {
     Script: IScriptService,
     Asset: IAssetService,
     Engine: IEngineService,
+    Animation: IAnimationService,
     Prefab: IPrefabService,
     Selection: ISelectionService,
     Operation: IOperationService,
@@ -67,5 +75,7 @@ export interface IServiceManager {
     Camera: ICameraService,
     Gizmo: IGizmoService,
     SceneView: ISceneViewService,
+    Preview: IPreviewService,
     UI: IUIService,
+    ReferenceImage: IReferenceImageService,
 }

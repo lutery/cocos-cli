@@ -17,13 +17,14 @@ import { PrefabEditor, SceneEditor } from './editors';
 import { IAssetInfo } from '../../../assets/@types/public';
 import { Rpc } from '../rpc';
 import { enrichMissingDependencyError } from './error-utils';
+import type { IEditorSessionService, IEditorSessionSnapshot } from './core/editor-session';
 
 /**
  * EditorAsset - 统一的编辑器管理入口
  * 作为调度器，根据资源类型动态创建和管理编辑器实例
  */
 @register('Editor')
-export class EditorService extends BaseService<IEditorEvents> implements IEditorService {
+export class EditorService extends BaseService<IEditorEvents> implements IEditorService, IEditorSessionService {
     private needReloadAgain: IReloadOptions | null = null;
     private lastSceneOrNode: TEditorEntity | undefined;
     private reloadPromise: Promise<TEditorEntity> | null = null;
@@ -34,6 +35,8 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
     private lockPromise: Promise<void> | null = null;
     private lockResolve: (() => void) | null = null;
     private _isReloading = false;
+    private lifecyclePromise: Promise<void> = Promise.resolve();
+    private editorSessionGeneration = 0;
 
     public async lock() {
         if (this.reloadPromise) {
@@ -79,6 +82,23 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
         return this.currentEditorUuid;
     }
 
+    public getEditorSession(): IEditorSessionSnapshot {
+        return {
+            uuid: this.currentEditorUuid,
+            generation: this.editorSessionGeneration,
+        };
+    }
+
+    public isCurrentEditorSession(session: IEditorSessionSnapshot): boolean {
+        return session.generation === this.editorSessionGeneration
+            && session.uuid === this.currentEditorUuid
+            && this.isOpen;
+    }
+
+    private invalidateEditorSession(): void {
+        this.editorSessionGeneration++;
+    }
+
     /**
      * 是否打开场景
      */
@@ -108,12 +128,29 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
         return editor ? await editor.encode() : null;
     }
 
+    /**
+     * 序列化当前正在编辑的场景（含未保存改动），返回可被 loadWithJson 加载的 JSON 字符串。
+     * 用于「Preview in Editor」：把编辑器里的实时场景交给游戏运行时预览。
+     * 该方法经 Service proxy 自动暴露到浏览器侧 window.cli.Scene.Editor.querySceneSerializedData。
+     */
+    async querySceneSerializedData(): Promise<string> {
+        const editor = this.currentEditorUuid && this.editorMap.get(this.currentEditorUuid);
+        if (editor instanceof SceneEditor) {
+            return editor.serializeCurrent();
+        }
+        throw new Error('[querySceneSerializedData] 当前没有打开场景');
+    }
+
     getRootNode(): cc.Scene | cc.Node | null {
         const editor = this.currentEditorUuid && this.editorMap.get(this.currentEditorUuid);
         return editor ? editor.getRootNode() : null;
     }
 
     async open(params: IOpenOptions): Promise<TEditorEntity> {
+        return this.runLifecycle(() => this.openUnlocked(params));
+    }
+
+    private async openUnlocked(params: IOpenOptions): Promise<TEditorEntity> {
         const { urlOrUUID } = params;
 
         const assetInfo = await Rpc.getInstance().request('assetManager', 'queryAssetInfo', [urlOrUUID]);
@@ -121,20 +158,28 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
             throw new Error(`通过 ${urlOrUUID} 无法打开，查询不到该资源信息`);
         }
 
-        if (this.currentEditorUuid) {
-            const currentEditor = this.editorMap.get(this.currentEditorUuid);
+        const currentEditorUuid = this.currentEditorUuid;
+        if (currentEditorUuid) {
+            const currentEditor = this.editorMap.get(currentEditorUuid);
             if (currentEditor) {
+                this.invalidateEditorSession();
                 try {
-                    // 关闭当前场景
-                    const assetInfo = await Rpc.getInstance().request('assetManager', 'queryAssetInfo', [this.currentEditorUuid]);
-                    if (assetInfo) {
-                        await currentEditor.close();
-                    }
+                    const currentAssetInfo = await Rpc.getInstance().request('assetManager', 'queryAssetInfo', [currentEditorUuid]);
+                    await currentEditor.close({ save: Boolean(currentAssetInfo) });
                 } catch (error) {
                     console.error(error);
-                } finally {
-                    this.editorMap.delete(this.currentEditorUuid);
+                    throw error;
                 }
+                this.editorMap.delete(currentEditorUuid);
+                if (this.currentEditorUuid === currentEditorUuid) {
+                    this.currentEditorUuid = null;
+                    this.isOpen = false;
+                }
+                this.emitInternal(InternalServiceEvents.EditorDisposed);
+            } else {
+                this.invalidateEditorSession();
+                this.currentEditorUuid = null;
+                this.isOpen = false;
             }
         }
 
@@ -164,48 +209,64 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
 
             // 设置当前打开的编辑器
             this.currentEditorUuid = assetInfo.uuid;
-            this.emit('editor:open');
+            this.invalidateEditorSession();
+            this.emit('editor:open', cc.director.getScene());
             this.isOpen = true;
             console.log(`打开 ${assetInfo.url}`);
             return encode;
         } catch (err) {
             await outputDependentInfo(err);
             this.editorMap.delete(uuid);
+            if (this.currentEditorUuid === uuid) {
+                this.currentEditorUuid = null;
+                this.isOpen = false;
+            }
             console.error(err);
             throw err;
         }
     }
 
     async close(params: ICloseOptions): Promise<boolean> {
+        return this.runLifecycle(() => this.closeUnlocked(params));
+    }
+
+    private async closeUnlocked(params: ICloseOptions): Promise<boolean> {
         const urlOrUUID = params.urlOrUUID ?? this.currentEditorUuid;
         try {
-            if (!urlOrUUID) return true;
+            const currentEditorUuid = this.currentEditorUuid;
+            if (!urlOrUUID || !currentEditorUuid) return true;
 
             const assetInfo = await Rpc.getInstance().request('assetManager', 'queryAssetInfo', [urlOrUUID]);
-            if (!assetInfo) {
-                throw new Error(`通过 ${urlOrUUID} 请求资源失败`);
+            const editor = assetInfo
+                ? this.editorMap.get(assetInfo.uuid)
+                : params.allowDeletedSourceFallback && params.expectedCurrentUuid === currentEditorUuid
+                    ? this.editorMap.get(currentEditorUuid)
+                    : undefined;
+            if (!editor) {
+                if (!assetInfo) {
+                    throw new Error(`通过 ${urlOrUUID} 请求资源失败`);
+                }
+                return true;
             }
 
-            const uuid = assetInfo.uuid;
-            const editor = this.editorMap.get(uuid);
-            if (!editor) return true;
-
+            this.invalidateEditorSession();
             const result = await editor.close({ save: params.save ?? true });
 
-            // 如果关闭的是当前打开的编辑器，清除当前状态
-            if (uuid === this.currentEditorUuid) {
+            if (editor === this.editorMap.get(currentEditorUuid)) {
                 this._clearUndoHistory();
                 this.currentEditorUuid = null;
             }
-
-            // 移除编辑器实例以释放内存
-            this.editorMap.delete(uuid);
+            for (const [uuid, candidate] of this.editorMap) {
+                if (candidate === editor) {
+                    this.editorMap.delete(uuid);
+                }
+            }
 
             this.emit('editor:close');
             // 真正关闭编辑器时的会话清理边界；重载只复用内容卸载/挂载边界。
             this.emitInternal(InternalServiceEvents.EditorDisposed);
             this.isOpen = false;
-            console.log(`关闭 ${assetInfo.url}`);
+            console.log(`关闭 ${assetInfo?.url ?? urlOrUUID}`);
             return result;
         } catch (error) {
             console.error(`关闭失败: [${urlOrUUID}]`, error);
@@ -214,24 +275,21 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
     }
 
     async save(params: ISaveOptions): Promise<IAssetInfo> {
+        return this.runLifecycle(() => this.saveUnlocked(params));
+    }
+
+    async saveAs(params: ISaveOptions): Promise<IAssetInfo> {
+        return this.runLifecycle(() => this.saveAsUnlocked(params));
+    }
+
+    private async saveUnlocked(params: ISaveOptions): Promise<IAssetInfo> {
         const urlOrUUID = params.urlOrUUID ?? this.currentEditorUuid;
         try {
-            if (!urlOrUUID) {
-                throw new Error('当前没有打开任何编辑器');
-            }
-
-            const assetInfo = await Rpc.getInstance().request('assetManager', 'queryAssetInfo', [urlOrUUID]);
-            if (!assetInfo) {
-                throw new Error(`通过 ${urlOrUUID} 请求资源失败`);
-            }
-
-            const uuid = assetInfo.uuid;
-            const editor = this.editorMap.get(uuid);
-            if (!editor) {
-                throw new Error(`当前没有打开任何编辑器`);
-            }
-
-            const result = await editor.save();
+            const { assetInfo, currentEditorUuid, editor } = await this.resolveSaveTarget(urlOrUUID);
+            const result = assetInfo.uuid === currentEditorUuid
+                ? await editor.save()
+                : await this.recoverDeletedSourceTo(assetInfo, currentEditorUuid, editor);
+            this.assertSavedTarget(result, assetInfo);
 
             this._markUndoSaved();
 
@@ -244,7 +302,84 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
         }
     }
 
+    private async recoverDeletedSourceTo(assetInfo: IAssetInfo, currentEditorUuid: string, editor: SceneEditor | PrefabEditor): Promise<IAssetInfo> {
+        const currentAssetInfo = await Rpc.getInstance().request('assetManager', 'queryAssetInfo', [currentEditorUuid]);
+        if (currentAssetInfo) {
+            throw new Error(`不能保存到非当前资源 ${assetInfo.url}，请使用另存为`);
+        }
+
+        const result = await editor.saveAs(assetInfo);
+        this.assertSavedTarget(result, assetInfo);
+        await this.openUnlocked({ urlOrUUID: result.uuid });
+        return result;
+    }
+
+    private async saveAsUnlocked(params: ISaveOptions): Promise<IAssetInfo> {
+        const urlOrUUID = params.urlOrUUID;
+        if (!urlOrUUID) {
+            throw new Error('另存为需要指定目标资源');
+        }
+        try {
+            const { assetInfo, editor } = await this.resolveSaveTarget(urlOrUUID);
+            const result = await editor.saveAs(assetInfo);
+            this.assertSavedTarget(result, assetInfo);
+            console.log(`另存为 ${assetInfo.url}`);
+            return result;
+        } catch (error) {
+            console.error(`另存为失败: [${urlOrUUID}]`, error);
+            throw error;
+        }
+    }
+
+    private async resolveSaveTarget(urlOrUUID: string | null | undefined): Promise<{ assetInfo: IAssetInfo; currentEditorUuid: string; editor: SceneEditor | PrefabEditor }> {
+        const currentEditorUuid = this.currentEditorUuid;
+        if (!urlOrUUID || !currentEditorUuid) {
+            throw new Error('当前没有打开任何编辑器');
+        }
+
+        const assetInfo = await Rpc.getInstance().request('assetManager', 'queryAssetInfo', [urlOrUUID]);
+        if (!assetInfo) {
+            throw new Error(`通过 ${urlOrUUID} 请求资源失败`);
+        }
+
+        const editor = this.editorMap.get(currentEditorUuid);
+        if (!editor) {
+            throw new Error('当前没有打开任何编辑器');
+        }
+        if (!this.isSaveTargetCompatible(editor, assetInfo.type)) {
+            throw new Error(`不能将 ${editor instanceof SceneEditor ? 'scene' : 'prefab'} 保存到 ${assetInfo.type} 资源`);
+        }
+
+        return { assetInfo, currentEditorUuid, editor };
+    }
+
+    private assertSavedTarget(result: IAssetInfo, target: IAssetInfo): void {
+        if (result.uuid !== target.uuid) {
+            throw new Error(`保存目标资源标识不一致: 期望 ${target.uuid}，实际 ${result.uuid}`);
+        }
+    }
+
+    private isSaveTargetCompatible(editor: SceneEditor | PrefabEditor, targetType: string): boolean {
+        if (editor instanceof SceneEditor) {
+            return targetType === 'scene' || targetType === 'cc.SceneAsset';
+        }
+        return targetType === 'prefab' || targetType === 'cc.Prefab';
+    }
+
     async reload(params: IReloadOptions): Promise<ReloadResult> {
+        return this.runLifecycle(() => this.reloadUnlocked(params));
+    }
+
+    public async reloadForSession(params: IReloadOptions, session: IEditorSessionSnapshot): Promise<ReloadResult> {
+        return this.runLifecycle(async () => {
+            if (!this.isCurrentEditorSession(session)) {
+                return ReloadResult.EDITOR_NOT_FOUND;
+            }
+            return this.reloadUnlocked(params);
+        });
+    }
+
+    private async reloadUnlocked(params: IReloadOptions): Promise<ReloadResult> {
         if (this._isReloading) {
             this.needReloadAgain = params;
             return ReloadResult.QUEUED;
@@ -267,8 +402,8 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
             }
 
             const editor = this.editorMap.get(assetInfo.uuid);
-            if (!editor) {
-                console.warn(`当前没有打开任何编辑器`);
+            if (!editor || assetInfo.uuid !== this.currentEditorUuid) {
+                console.warn('当前没有打开任何编辑器');
                 this._isReloading = false;
                 return ReloadResult.EDITOR_NOT_FOUND;
             }
@@ -315,6 +450,20 @@ export class EditorService extends BaseService<IEditorEvents> implements IEditor
             console.error(error);
             this._isReloading = false;
             return ReloadResult.FAILED;
+        }
+    }
+
+    private async runLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+        const previous = this.lifecyclePromise;
+        let release!: () => void;
+        this.lifecyclePromise = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        await previous;
+        try {
+            return await operation();
+        } finally {
+            release();
         }
     }
 

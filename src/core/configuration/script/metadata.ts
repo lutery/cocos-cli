@@ -7,6 +7,7 @@ export interface ICocosConfigurationPropertySchema {
     default?: unknown;
     title?: string;
     description?: string;
+    hidden?: boolean;
     enum?: Array<string | number | boolean>;
     enumDescriptions?: string[];
     minimum?: number;
@@ -17,6 +18,11 @@ export interface ICocosConfigurationPropertySchema {
     items?: ICocosConfigurationPropertySchema | ICocosConfigurationPropertySchema[];
     additionalProperties?: boolean | ICocosConfigurationPropertySchema;
     required?: string[];
+    ui?: 'asset-picker' | string;
+    assetType?: string;
+    valueField?: string;
+    displayFields?: string[];
+    query?: Record<string, unknown>;
 }
 
 export interface ICocosConfigurationNode {
@@ -35,6 +41,7 @@ export interface IConfigurationItemBase {
     label?: string;
     description?: string;
     default?: unknown;
+    hidden?: boolean;
 }
 
 export type IConfigurationItem =
@@ -329,6 +336,7 @@ export function convertConfigItem(
             default: item.default,
             title,
             description,
+            hidden: item.hidden,
         };
 
     case 'number':
@@ -337,6 +345,7 @@ export function convertConfigItem(
             default: item.default,
             title,
             description,
+            hidden: item.hidden,
             minimum: item.minimum,
             maximum: item.maximum,
             step: item.step,
@@ -348,6 +357,7 @@ export function convertConfigItem(
             default: item.default,
             title,
             description,
+            hidden: item.hidden,
         };
 
     case 'enum': {
@@ -358,6 +368,7 @@ export function convertConfigItem(
             default: defaultValue,
             title,
             description,
+            hidden: item.hidden,
             enum: values,
             enumDescriptions: descriptions,
         };
@@ -376,6 +387,7 @@ export function convertConfigItem(
             default: Array.isArray(item.default) ? item.default : [],
             title,
             description,
+            hidden: item.hidden,
         });
     }
 
@@ -402,6 +414,7 @@ export function convertConfigItem(
                 default: item.default,
                 title,
                 description,
+                hidden: item.hidden,
                 required: item.required,
                 additionalProperties: item.additionalProperties,
             }

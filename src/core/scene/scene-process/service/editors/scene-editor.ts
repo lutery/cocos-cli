@@ -1,4 +1,4 @@
-import { Scene, SceneAsset, Component, Node } from 'cc';
+import { Scene, SceneAsset } from 'cc';
 import { type IBaseIdentifier, ICreateOptions, IEditorTarget, IScene, INodeDumpOptions } from '../../../common';
 import { Rpc } from '../../rpc';
 import { sceneUtils } from '../scene/utils';
@@ -58,8 +58,36 @@ export class SceneEditor extends BaseEditor {
         if (!this.entity) {
             throw new Error('[save] 没有打开场景');
         }
+        return this.saveSerializedDataToAsset(this.entity.identifier.assetUuid);
+    }
+
+    /**
+     * 序列化「当前正在编辑」的实时场景（含未保存改动），返回 JSON 字符串。
+     * 复用 save/reload 完全一致的 sceneUtils.serialize 路径，因此其输出可被
+     * cc.assetManager.loadWithJson 加载（等价于 querySceneSerializedData）。
+     * 默认 stringify:true，返回的是 JSON 字符串（非对象）。
+     */
+    serializeCurrent(): string {
+        if (!this.entity) {
+            throw new Error('[serializeCurrent] 没有打开场景');
+        }
+        return sceneUtils.serialize(this.entity.instance as Scene) as string;
+    }
+
+    async saveAs(asset: IAssetInfo): Promise<IAssetInfo> {
+        return this.saveSerializedDataToAsset(asset.uuid);
+    }
+
+    private async saveSerializedDataToAsset(assetUuid: string): Promise<IAssetInfo> {
+        if (!this.entity) {
+            throw new Error('[save] 没有打开场景');
+        }
         const serializedData = sceneUtils.serialize(this.entity.instance as Scene);
-        return await Rpc.getInstance().request('assetManager', 'saveAsset', [this.entity.identifier.assetUuid, serializedData]);
+        const saved = await Rpc.getInstance().request('assetManager', 'saveAsset', [assetUuid, serializedData]);
+        if (!saved || saved.uuid !== assetUuid) {
+            throw new Error(`保存目标资源标识不一致: 期望 ${assetUuid}，实际 ${saved?.uuid ?? 'undefined'}`);
+        }
+        return saved;
     }
 
     protected async _doReload(): Promise<IScene> {

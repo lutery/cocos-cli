@@ -3,8 +3,9 @@ import path from 'path';
 import { EventEmitter } from 'events';
 import { SceneProcessEventTag, SceneReadyChannel } from '../common';
 import { Rpc } from './rpc';
+import type { SceneCommandProviderRegistration } from './rpc';
 import { getServerUrl } from '../../../server';
-import { listenModuleMessages } from './messages';
+import { disposeModuleMessages, listenModuleMessages } from './messages';
 import { getAvailablePort } from '../../../server/utils';
 
 export interface ISceneWorkerEvents {
@@ -32,6 +33,7 @@ export class SceneWorker {
     private projectPath: string = ''; // 项目路径
     private isRestarting = false; // 是否正在重启中
     private isManualStop = false; // 是否手动停止
+    private commandProviderRegistration: SceneCommandProviderRegistration | null = null;
 
     async start(enginePath: string, projectPath: string): Promise<boolean> {
         if (this._process) {
@@ -46,6 +48,7 @@ export class SceneWorker {
         return new Promise(async (resolve) => {
             let isResolved = false;
             let startupTimer: NodeJS.Timeout | null = null;
+            let registration: SceneCommandProviderRegistration | null = null;
 
             const cleanup = () => {
                 if (startupTimer) {
@@ -60,6 +63,12 @@ export class SceneWorker {
                     cleanup();
                     resolve(result);
                 }
+            };
+
+            const releaseRegistration = () => {
+                const ownedRegistration = registration;
+                registration = null;
+                this.releaseCommandProvider(ownedRegistration);
             };
 
             try {
@@ -83,6 +92,7 @@ export class SceneWorker {
                     this._process?.off('error', onError);
                     this._process?.off('exit', onEarlyExit);
                     this._process = null;
+                    releaseRegistration();
                     resolveOnce(false);
                 };
 
@@ -92,17 +102,35 @@ export class SceneWorker {
                     this._process?.off('error', onError);
                     this._process?.off('exit', onEarlyExit);
                     this._process = null;
+                    releaseRegistration();
                     resolveOnce(false);
                 };
 
                 // 监听就绪消息
+                let listenerPromise: Promise<void> | null = null;
+                const failStartup = (error: unknown) => {
+                    console.error('注册场景进程监听器失败:', error);
+                    this._process?.off('message', onReady);
+                    this._process?.off('error', onError);
+                    this._process?.off('exit', onEarlyExit);
+                    if (this._process) {
+                        this._process.kill('SIGTERM');
+                        this._process = null;
+                    }
+                    releaseRegistration();
+                    resolveOnce(false);
+                };
+
                 const onReady = (msg: any) => {
                     if (msg === SceneReadyChannel) {
                         console.log('Scene process start.');
                         this._process?.off('message', onReady);
                         this._process?.off('error', onError);
                         this._process?.off('exit', onEarlyExit);
-                        resolveOnce(true);
+                        void (listenerPromise ?? Promise.resolve()).then(
+                            () => resolveOnce(true),
+                            failStartup,
+                        );
                     }
                 };
 
@@ -116,6 +144,7 @@ export class SceneWorker {
                         this._process.kill('SIGTERM');
                         this._process = null;
                     }
+                    releaseRegistration();
                     resolveOnce(false);
                 }, 30000);
 
@@ -125,12 +154,15 @@ export class SceneWorker {
                 this._process.on('message', onReady);
 
                 // 启动RPC和注册监听器
-                Rpc.startup(this._process);
-                this.registerListener();
+                registration = Rpc.startup(this._process);
+                this.commandProviderRegistration = registration;
+                listenerPromise = this.registerListener();
+                listenerPromise.catch(failStartup);
 
             } catch (error) {
                 console.error('创建场景进程失败:', error);
                 this._process = null;
+                releaseRegistration();
                 resolveOnce(false);
             }
         });
@@ -138,8 +170,12 @@ export class SceneWorker {
 
     async stop() {
         const process = this._process;
-        if (!process) return true;
+        if (!process) {
+            this.releaseCommandProvider();
+            return true;
+        }
         this.isManualStop = true;
+        disposeModuleMessages();
         return new Promise<boolean>((resolve) => {
             let settled = false;
             const cleanup = () => {
@@ -265,6 +301,7 @@ export class SceneWorker {
     }
 
     async registerListener() {
+        const registration = this.commandProviderRegistration;
 
         this.process.on('message', (msg: { type: string, event: string, args: any[] }) => {
             if (msg && msg.type === SceneProcessEventTag) {
@@ -294,6 +331,8 @@ export class SceneWorker {
         });
 
         this.process.on('exit', (code: number, signal) => {
+            this.releaseCommandProvider(registration);
+            disposeModuleMessages();
             if (code !== 0) {
                 console.error(`场景进程退出异常 code:${code}, signal:${signal}`);
                 
@@ -319,6 +358,16 @@ export class SceneWorker {
         });
         // 监听主进程模块的事件
         await listenModuleMessages();
+    }
+
+    /** Releases only the provider registration acquired by the current Scene Worker. */
+    private releaseCommandProvider(
+        registration: SceneCommandProviderRegistration | null = this.commandProviderRegistration,
+    ): void {
+        if (this.commandProviderRegistration === registration) {
+            this.commandProviderRegistration = null;
+        }
+        registration?.dispose();
     }
 
     /**
@@ -406,6 +455,8 @@ export class SceneWorker {
         if (event) {
             this.eventEmitter.removeAllListeners(event);
         } else {
+            disposeModuleMessages();
+            this.releaseCommandProvider();
             this.eventEmitter.removeAllListeners();
             // 重置重启相关状态
             this.currentRestartCount = 0;

@@ -476,7 +476,14 @@ export class BundleManager extends BuildTaskBase implements IBundleManager {
     private async initBundleRootAssets() {
         this.updateProcess('Init bundle root assets start...');
         if (this.bundleMap[INTERNAL]) {
-            const internalAssets = await queryPreloadAssetList(this.options.includeModules, this.options.engineInfo.typescript.path);
+            const enginePath = this.options.engineInfo.typescript.path;
+            // 预览用完整引擎，会初始化所有子系统（例如即便项目只用 2D 物理，3D PhysicsSystem 仍会构造并
+            // 加载其默认材质 default-physics-material）。因此预览下内置资源不按 includeModules 裁剪，
+            // 取「全部」feature 的 dependentAssets，与场景编辑器 Engine.queryInternalAssetList / 编辑器内置包
+            // 行为一致；否则会漏掉未选模块的内置资源，运行时报 "Failed to load builtinMaterial"。
+            const internalAssets = this.options.preview
+                ? await queryAllPreloadAssetList(enginePath)
+                : await queryPreloadAssetList(this.options.includeModules, enginePath);
             // 添加引擎依赖的预加载内置资源/脚本到 internal 包内
             console.debug(`Query preload assets/scripts from cc.config.json`);
             internalAssets.forEach((uuid) => {
@@ -535,6 +542,10 @@ export class BundleManager extends BuildTaskBase implements IBundleManager {
         }
 
         if (launchBundle) {
+            if (this.options.preview && (this.options as any).sceneEditor) {
+                this.addSceneEditorAssets(launchBundle);
+            }
+
             // 加入项目设置中的 renderPipeline 资源
             if (this.options.renderPipeline) {
                 launchBundle.addRootAsset(buildAssetLibrary.getAsset(this.options.renderPipeline));
@@ -550,6 +561,18 @@ export class BundleManager extends BuildTaskBase implements IBundleManager {
         console.debug(`  Number of all scripts: ${this.cache.scriptUuids.length}`);
         console.debug(`  Number of other assets: ${this.cache.assetUuids.length}`);
         this.updateProcess('Init bundle root assets success...');
+    }
+
+    private addSceneEditorAssets(bundle: IBundle) {
+        for (const uuid of this.cache.assetUuids) {
+            const asset = buildAssetLibrary.getAsset(uuid);
+            // 引擎内置资源已经由 internal bundle 统一收集。Scene Editor 预览若再把它们
+            // 加入启动 bundle，会让同一资源进入两个 bundle；例如 default_skybox 的 HDR
+            // 与 PNG 会在主 bundle 中得到相同的动态加载 URL。
+            if (asset && !asset.url.startsWith('db://internal/')) {
+                bundle.addRootAsset(asset);
+            }
+        }
     }
 
     /**
@@ -944,6 +967,17 @@ async function queryPreloadAssetList(features: string[], enginePath: string) {
     preloadAssets.length = 0;
     traversalDependencies(features, featuresInJson);
     return Array.from(new Set(preloadAssets));
+}
+
+/**
+ * 查询「全部」内置预加载资源（不按 includeModules 裁剪）。
+ * 预览使用完整引擎，任何子系统都可能初始化并加载其内置资源，需保证全部可用，
+ * 与场景编辑器 Engine.queryInternalAssetList 行为一致。
+ */
+async function queryAllPreloadAssetList(enginePath: string) {
+    const ccConfigJson = await readJSON(join(enginePath, 'cc.config.json'));
+    const featureNames = Object.keys(ccConfigJson.features || {});
+    return queryPreloadAssetList(featureNames, enginePath);
 }
 
 /**

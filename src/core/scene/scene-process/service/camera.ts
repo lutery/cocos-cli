@@ -1,6 +1,6 @@
 import { Camera, Canvas, Color, Layers, Vec3, gfx } from 'cc';
 import { BaseService } from './core';
-import { register, Service } from './core/decorator';
+import { register, Service, queryRegisteredService } from './core/decorator';
 import { CameraController2D } from './camera/camera-controller-2d';
 import { CameraController3D } from './camera/camera-controller-3d';
 import CameraControllerBase from './camera/camera-controller-base';
@@ -8,7 +8,7 @@ import { CameraMoveMode, CameraUtils } from './camera/utils';
 import EditorCameraComponent from './camera/editor-camera-component';
 import { OperationPriority } from './operation/types';
 import { Rpc } from '../rpc';
-import type { ICameraConfig, ICameraEvents, ICameraService, IOriginAxesConfig } from '../../common';
+import type { ICameraConfig, ICameraEvents, ICameraService, IGizmoService, IOriginAxesConfig } from '../../common';
 import type { IGizmoConfig } from '../../scene-configs';
 
 /**
@@ -23,6 +23,7 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
     private _controllerFirstChange = false;
     private _currentUuid = '';
     private _cameraInfos: Record<string, any> = {};
+    private _cameraUuids: string[] = [];
 
     get controller2D() { return this._controller2D; }
     get controller3D() { return this._controller3D; }
@@ -99,43 +100,74 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
                     // view may not be ready
                 }
 
-                this.initFromConfig();
             }
 
+            const initConfigTask = this.initFromConfig();
             this.refresh();
 
-            const scene = (cc as any).director?.getScene();
-            const uuid = scene?.uuid || '';
+            const uuid = this._getCurrentViewUuid();
             if (this._currentUuid !== uuid) {
                 this._currentUuid = uuid;
                 this._controllerFirstChange = false;
             }
 
             this._detachSceneCameras();
-
-            setTimeout(() => {
-                try {
-                    this._controller.updateGrid();
-                    this.defaultFocus(this._currentUuid);
-                    Service.Engine.repaintInEditMode();
-                } catch (e) {
-                    console.warn('[Camera] deferred grid update failed:', e);
-                }
-            }, 200);
+            void this._restoreCameraView(initConfigTask);
         } catch (e) {
             console.warn('[Camera] onEditorOpened failed:', e);
+        }
+    }
+
+    private async _restoreCameraView(initConfigTask?: Promise<void>): Promise<void> {
+        const uuid = this._currentUuid;
+        try {
+            await initConfigTask;
+            await this.loadCameraInfos();
+            if (uuid !== this._currentUuid) {
+                return;
+            }
+            this._controller.updateGrid();
+            this.defaultFocus(uuid);
+            this._refreshSelectedGizmos();
+            Service.Engine.repaintInEditMode();
+        } catch (e) {
+            console.warn('[Camera] restore camera view failed:', e);
+        }
+    }
+
+    private _getCurrentViewUuid(): string {
+        try {
+            const editorUuid = (Service.Editor as unknown as { getCurrentEditorUuid?: () => string | null })
+                .getCurrentEditorUuid?.();
+            if (editorUuid) {
+                return editorUuid;
+            }
+        } catch {
+            // Editor service may not be registered in early init or isolated tests.
+        }
+        const scene = (cc as any).director?.getScene?.();
+        return scene?.uuid || '';
+    }
+
+    private _refreshSelectedGizmos(): void {
+        try {
+            (Service.Gizmo as unknown as { refreshSelectedGizmos?: () => void })
+                .refreshSelectedGizmos?.();
+        } catch {
+            // Selection/Gizmo may not be registered while opening isolated editor views.
         }
     }
 
     async initFromConfig(): Promise<void> {
         try {
             const rpc = Rpc.getInstance();
-            const config = await rpc.request('sceneConfigInstance', 'get', ['camera']) as ICameraConfig | undefined;
+            const config = await rpc.request('sceneConfigInstance', 'get', ['camera', 'local']) as ICameraConfig | undefined;
             if (config) {
                 this._applyConfig(config, false);
             }
             const gizmoConfig = await rpc.request('sceneConfigInstance', 'get', ['gizmo']) as Partial<IGizmoConfig> | undefined;
             if (gizmoConfig) {
+                this._applyGizmoViewMode(gizmoConfig);
                 this._applyGizmoDisplay(gizmoConfig);
             }
         } catch {
@@ -143,20 +175,52 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
         }
     }
 
+    /**
+     * 加载相机视角记忆（按 scene UUID 存储）。每次打开场景都要重新加载，
+     * 因为 CameraService 会在多个场景间复用，只在首次创建相机时加载会导致后续场景取到旧数据。
+     */
+    async loadCameraInfos(): Promise<void> {
+        try {
+            const rpc = Rpc.getInstance();
+            const cameraInfos = await rpc.request('sceneConfigInstance', 'get', ['camera-infos', 'local']);
+            const cameraUuids = await rpc.request('sceneConfigInstance', 'get', ['camera-uuids', 'local']);
+            this._cameraInfos = (cameraInfos as Record<string, any>) || {};
+            this._cameraUuids = (cameraUuids as string[]) || [];
+        } catch {
+            // camera-infos 不存在时使用默认空值
+        }
+    }
+
     private _applyGizmoDisplay(config: Partial<IGizmoConfig>): void {
         if (config.gridVisible !== undefined) this.setGridVisible(config.gridVisible, false);
-        if (config.gridColor !== undefined) this.setGridColor(config.gridColor);
-        if (config.originAxis2D !== undefined) this.setOriginAxes2D(config.originAxis2D);
-        if (config.originAxis3D !== undefined) this.setOriginAxes3D(config.originAxis3D);
+        if (config.gridColor !== undefined) this.setGridColor(config.gridColor, false);
+        this._syncControllerGridVisibility();
         Service.Engine.repaintInEditMode();
     }
 
-    setGridColor(color: number[]): void {
-        const [r = 166, g = 166, b = 166] = color;
-        this._controller2D.lineColor = new Color(r, g, b, 255);
-        (this._controller3D as any).lineColor = new Color(r, g, b, 50);
-        this._controller2D.updateGrid();
+    private _applyGizmoViewMode(config: Partial<IGizmoConfig>): void {
+        if (config.is2D !== undefined && this.is2D !== config.is2D) {
+            this.is2D = config.is2D;
+        }
+    }
+
+    setGridColor(color: number[], persist = true): void {
+        if (!color || color.length < 3) return;
+        // gridColor 的配置归 Gizmo 的 GizmoConfig 所有并由其统一持久化（与 cocos-editor GizmoManager 一致）。
+        // 面板经由本方法改色时转交 Gizmo：更新运行时配置并定向落盘（gizmo.gridColor），避免只改渲染而不落盘（重开丢失）。
+        // Gizmo.setGridColor 内部会回调本方法（persist=false）完成 2D/3D 控制器渲染。
+        if (persist) {
+            const gizmo = queryRegisteredService<IGizmoService>('Gizmo');
+            if (gizmo) {
+                gizmo.setGridColor(color); // 其内部会回调 setGridColor(color, false) 完成渲染
+                return;
+            }
+        }
+        const [r = 166, g = 166, b = 166, a = 255] = color;
+        this._controller3D.lineColor = new Color(r, g, b, a);
         this._controller3D.updateGrid();
+        this._controller2D.lineColor = new Color(r, g, b, a);
+        this._controller2D.updateGrid();
         Service.Engine?.repaintInEditMode?.();
     }
 
@@ -165,11 +229,13 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
             x: originAxes.x,
             y: originAxes.y,
         });
+        this._syncControllerGridVisibility();
         Service.Engine?.repaintInEditMode?.();
     }
 
     setOriginAxes3D(originAxes: IOriginAxesConfig): void {
         (this._controller3D as any).updateOriginAxisByConfig?.(originAxes);
+        this._syncControllerGridVisibility();
         Service.Engine?.repaintInEditMode?.();
     }
 
@@ -178,15 +244,24 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
         if (config.fov !== undefined) this.setCameraProperty({ fov: config.fov }, false);
         if (config.far !== undefined) {
             this._controller3D.far = config.far;
-            this._camera.far = config.far;
+            if (this._camera && !this.is2D) this._camera.far = config.far;
         }
         if (config.near !== undefined) {
             this._controller3D.near = config.near;
-            this._camera.near = config.near;
+            if (this._camera && !this.is2D) this._camera.near = config.near;
         }
         if (config.wheelSpeed !== undefined) this._controller3D.wheelSpeed = config.wheelSpeed;
         if (config.wanderSpeed !== undefined) this._controller3D.wanderSpeed = config.wanderSpeed;
         if (config.enableAcceleration !== undefined) this._controller3D.enableAcceleration = config.enableAcceleration;
+        if (config.far2D !== undefined) {
+            this._controller2D.far = config.far2D;
+            if (this._camera && this.is2D) this._camera.far = config.far2D;
+        }
+        if (config.near2D !== undefined) {
+            this._controller2D.near = config.near2D;
+            if (this._camera && this.is2D) this._camera.near = config.near2D;
+        }
+        if (config.wheelSpeed2D !== undefined) this._controller2D.wheelSpeed = config.wheelSpeed2D;
         if (config.aperture !== undefined || config.shutter !== undefined || config.iso !== undefined) {
             this.setCameraProperty({
                 aperture: config.aperture,
@@ -203,7 +278,7 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
     private async _saveConfig(): Promise<void> {
         try {
             const rpc = Rpc.getInstance();
-            await rpc.request('sceneConfigInstance', 'set', ['camera', this.queryConfig()]);
+            await rpc.request('sceneConfigInstance', 'set', ['camera', this.queryConfig(), 'local']);
         } catch {
             // Config persistence not available
         }
@@ -263,19 +338,26 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
         if (value === undefined || value === null) return;
         this._controller2D.isGridVisible = value;
         this._controller3D.isGridVisible = value;
-        const deActiveCtrl = this._controller === this._controller3D
-            ? this._controller2D
-            : this._controller3D;
-        deActiveCtrl.showGrid(false);
+        this._syncControllerGridVisibility();
         Service.Engine.repaintInEditMode();
         if (persist) {
             const rpc = Rpc.getInstance();
-            void rpc.request('sceneConfigInstance', 'set', ['gizmo.gridVisible', value]).catch(() => {});
+            void rpc.request('sceneConfigInstance', 'set', ['gizmo.gridVisible', value, 'local']).catch(() => {});
         }
     }
 
     isGridVisible(): boolean {
         return this._controller?.isGridVisible ?? true;
+    }
+
+    private _syncControllerGridVisibility(): void {
+        if (!this._controller || !this._controller2D || !this._controller3D) return;
+        const activeCtrl = this._controller;
+        const inactiveCtrl = activeCtrl === this._controller3D
+            ? this._controller2D
+            : this._controller3D;
+        activeCtrl.showGrid(activeCtrl.isGridVisible);
+        inactiveCtrl.showGrid(false);
     }
 
     setCameraProperty(options: any, persist = true): void {
@@ -306,6 +388,7 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
     resetCameraProperty(): void {
         this._controller3D.wanderSpeed = 10;
         this._controller3D.enableAcceleration = true;
+        this.setCameraProperty({ aperture: 19, shutter: 7, iso: 0 }, false);
         if (this.is2D) {
             this._controller2D.wheelSpeed = 6;
             this.setCameraProperty({ fov: 45, far: 10000, near: 6, clearColor: [48, 48, 48, 255] });
@@ -324,11 +407,15 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
                 ? [Math.round(clearColor.r), Math.round(clearColor.g), Math.round(clearColor.b), Math.round(clearColor.a)]
                 : [48, 48, 48, 255],
             fov: this._camera?.fov ?? 45,
-            far: this._camera?.far ?? this._controller3D.far,
-            near: this._camera?.near ?? this._controller3D.near,
+            // 3D 的 near/far 取自 3D 控制器，避免受当前激活相机（可能是 2D）影响
+            far: this._controller3D.far,
+            near: this._controller3D.near,
             wheelSpeed: this._controller3D.wheelSpeed,
             wanderSpeed: this._controller3D.wanderSpeed,
             enableAcceleration: this._controller3D.enableAcceleration,
+            far2D: this._controller2D.far,
+            near2D: this._controller2D.near,
+            wheelSpeed2D: this._controller2D.wheelSpeed,
             aperture: typeof camera?.aperture === 'number' ? camera.aperture : 19,
             shutter: typeof camera?.shutter === 'number' ? camera.shutter : 7,
             iso: typeof camera?.iso === 'number' ? camera.iso : 0,
@@ -380,6 +467,58 @@ export class CameraService extends BaseService<ICameraEvents> implements ICamera
 
     getCamera() {
         return this._camera;
+    }
+
+    getCurCameraInfo(): any {
+        const curCameraNode = this._controller3D.node;
+        const curCameraPos = curCameraNode.getWorldPosition();
+        const curCameraRot = curCameraNode.getWorldRotation();
+        const position = { x: curCameraPos.x, y: curCameraPos.y, z: curCameraPos.z };
+        const rotation = { x: curCameraRot.x, y: curCameraRot.y, z: curCameraRot.z, w: curCameraRot.w };
+        const sceneViewCenter = this._controller3D.sceneViewCenter;
+        const viewCenter = { x: sceneViewCenter.x, y: sceneViewCenter.y, z: sceneViewCenter.z };
+        // 2D 视图状态（对齐 Creator：一并记录 contentRect + scale2D，使 2D 场景视角可完整恢复）
+        const rect2D = this._controller2D.contentRect;
+        const contentRect = { x: rect2D.x, y: rect2D.y, width: rect2D.width, height: rect2D.height };
+        const scale = this._controller2D.scale2D;
+        return { position, rotation, viewCenter, contentRect, scale };
+    }
+
+    async saveCameraInfos(uuid?: string, write = true): Promise<void> {
+        uuid = uuid ?? this._currentUuid;
+        if (!uuid) return;
+        const cameraInfo = this.getCurCameraInfo();
+        const index = this._cameraUuids.indexOf(uuid);
+
+        if (index !== -1) {
+            delete this._cameraInfos[uuid];
+            this._cameraUuids.splice(index, 1);
+            this._cameraUuids.push(uuid);
+        } else {
+            this._cameraUuids.push(uuid);
+            if (this._cameraUuids.length > 50) {
+                delete this._cameraInfos[this._cameraUuids[0]];
+                this._cameraUuids.splice(0, 1);
+            }
+        }
+        this._cameraInfos[uuid] = cameraInfo;
+        if (write) {
+            try {
+                const rpc = Rpc.getInstance();
+                await rpc.request('sceneConfigInstance', 'set', ['camera-infos', this._cameraInfos, 'local']);
+                await rpc.request('sceneConfigInstance', 'set', ['camera-uuids', this._cameraUuids, 'local']);
+            } catch {
+                // persistence not available
+            }
+        }
+    }
+
+    onEditorClosed(): void {
+        this.saveCameraInfos(undefined, false);
+    }
+
+    onEditorSaved(): void {
+        void this.saveCameraInfos();
     }
 
     /**

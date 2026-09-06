@@ -8,6 +8,8 @@ import type { IGizmoEvents } from './gizmo';
 import type { ICameraEvents } from './camera';
 import type { ISceneViewEvents } from './scene-view';
 import type { IUndoEvents } from './undo';
+import type { IAnimationEvents } from './animation';
+import type { IReferenceImageEvents } from './reference-image';
 
 /**
  * messageManager 不在已有接口中的补充事件
@@ -33,4 +35,6 @@ export interface IMessageManagerEvents extends
     ICameraEvents,
     ISceneViewEvents,
     IUndoEvents,
+    IAnimationEvents,
+    IReferenceImageEvents,
     ISceneEvents {}

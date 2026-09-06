@@ -1,4 +1,4 @@
-import { Camera, Color, gfx, js, Layers, Mat4, MeshRenderer, Node, Quat, Vec3, ISizeLike } from 'cc';
+import { Camera, CCObject, Color, geometry, gfx, js, Layers, Mat4, MeshRenderer, Node, Quat, Vec2, Vec3, ISizeLike } from 'cc';
 import CameraControllerBase, { EditorCameraInfo } from './camera-controller-base';
 import { CameraMoveMode, CameraUtils } from './utils';
 import FiniteStateMachine from '../utils/state-machine/finite-state-machine';
@@ -11,31 +11,245 @@ import WanderMode from './modes/wander-mode';
 import type ModeBase3D from './modes/mode-base-3d';
 import type { ISceneMouseEvent, ISceneKeyboardEvent } from '../operation/types';
 import { Service } from '../core/decorator';
+import { getRaycastResultsForSnap } from '../gizmo/utils/engine-utils';
+import { Rpc } from '../../rpc';
 
 // ---------- node utility helpers ----------
 
-function getCenterWorldPos3D(nodes: Node[]): Vec3 {
-    if (nodes.length === 0) return new Vec3();
-    if (nodes.length === 1) return nodes[0].getWorldPosition();
-    const center = new Vec3();
-    for (const node of nodes) {
-        Vec3.add(center, center, node.getWorldPosition());
+const tempMatrix = new Mat4();
+
+function limitRange(distance: number): number {
+    return Math.min(Math.max(distance, -1e10), 1e10);
+}
+
+function getMainWindowSize(): ISizeLike {
+    const canvas = (cc as any).game?.canvas;
+    return {
+        width: canvas?.width ?? 1280,
+        height: canvas?.height ?? 720,
+    };
+}
+
+function getObbFromRect(mat: Mat4, rect: any, outBL?: Vec2 | null, outTL?: Vec2 | null, outTR?: Vec2 | null, outBR?: Vec2 | null): Vec2[] {
+    const x = rect.x;
+    const y = rect.y;
+    const width = rect.width;
+    const height = rect.height;
+
+    const tx = mat.m00 * x + mat.m04 * y + mat.m12;
+    const ty = mat.m01 * x + mat.m05 * y + mat.m13;
+    const xa = mat.m00 * width;
+    const xb = mat.m01 * width;
+    const yc = mat.m04 * height;
+    const yd = mat.m05 * height;
+
+    outBL = outBL || new Vec2();
+    outTL = outTL || new Vec2();
+    outTR = outTR || new Vec2();
+    outBR = outBR || new Vec2();
+
+    outTL.x = tx;
+    outTL.y = ty;
+    outTR.x = xa + tx;
+    outTR.y = xb + ty;
+    outBL.x = yc + tx;
+    outBL.y = yd + ty;
+    outBR.x = xa + yc + tx;
+    outBR.y = xb + yd + ty;
+
+    return [outBL, outTL, outTR, outBR];
+}
+
+function getObbFromBound(aabb: geometry.AABB): Vec3[] {
+    const minPos = new Vec3();
+    const maxPos = new Vec3();
+    aabb.getBoundary(minPos, maxPos);
+
+    return [
+        minPos,
+        new Vec3(maxPos.x, minPos.y, minPos.z),
+        new Vec3(maxPos.x, maxPos.y, minPos.z),
+        new Vec3(minPos.x, maxPos.y, minPos.z),
+        maxPos,
+        new Vec3(minPos.x, maxPos.y, maxPos.z),
+        new Vec3(minPos.x, minPos.y, maxPos.z),
+        new Vec3(maxPos.x, minPos.y, maxPos.z),
+    ];
+}
+
+function getObbFromMeshRenderer(modelComp: MeshRenderer, mat: Mat4): Vec3[] {
+    modelComp.model?.updateWorldBound?.();
+    let worldBound = modelComp.model?.worldBounds;
+    if (!worldBound) {
+        worldBound = geometry.AABB.create();
+        const modelBound = modelComp.model?.modelBounds;
+        if (modelBound) {
+            geometry.AABB.transform(worldBound, modelBound, mat);
+        } else {
+            geometry.AABB.transform(worldBound, worldBound, Mat4.IDENTITY);
+        }
     }
-    Vec3.multiplyScalar(center, center, 1 / nodes.length);
-    return center;
+    return getObbFromBound(worldBound);
+}
+
+function getObbFromUITransform(modelComp: any, mat: Mat4): Vec3[] {
+    let size = (cc as any).size(0, 0);
+    let width = size.width;
+    let height = size.height;
+    const rect = new (cc as any).Rect(0, 0, width, height);
+    const outBL = new Vec2();
+    const outTL = new Vec2();
+    const outTR = new Vec2();
+    const outBR = new Vec2();
+    if (modelComp) {
+        size = modelComp.contentSize;
+        width = size.width;
+        height = size.height;
+        const anchor = modelComp.anchorPoint;
+
+        rect.x = -anchor.x * width;
+        rect.y = -anchor.y * height;
+        rect.width = width;
+        rect.height = height;
+    }
+
+    const bounds = getObbFromRect(mat, rect, outBL, outTL, outTR, outBR);
+    const pos = getWorldPosition3D(modelComp.node);
+    return bounds.map(item => new Vec3(item.x, item.y, pos.z));
+}
+
+function getWorldOrientedBounds(node: Node): Vec3[] {
+    node.getWorldMatrix(tempMatrix);
+
+    const modelComp = node.getComponent(MeshRenderer);
+    if (modelComp) {
+        return getObbFromMeshRenderer(modelComp, tempMatrix);
+    }
+
+    const UITransform = (cc as any).UITransform;
+    const uiComp = UITransform ? node.getComponent(UITransform) : null;
+    if (uiComp) {
+        return getObbFromUITransform(uiComp, tempMatrix);
+    }
+
+    const rect = new (cc as any).Rect(0, 0, 0, 0);
+    const bounds = getObbFromRect(tempMatrix, rect);
+    const pos = getWorldPosition3D(node);
+    return bounds.map(item => new Vec3(item.x, item.y, pos.z));
+}
+
+function getCenterWorldPos3D(nodes: Node[]): Vec3 {
+    let minX: number | null = null;
+    let minY: number | null = null;
+    let minZ: number | null = null;
+    let maxX: number | null = null;
+    let maxY: number | null = null;
+    let maxZ: number | null = null;
+
+    for (let i = 0; i < nodes.length; ++i) {
+        const bounds = getWorldOrientedBounds(nodes[i]);
+        for (let j = 0; j < bounds.length; ++j) {
+            const v = bounds[j];
+            if (minX === null || v.x < minX) minX = v.x;
+            if (maxX === null || v.x > maxX) maxX = v.x;
+            if (minY === null || v.y < minY) minY = v.y;
+            if (maxY === null || v.y > maxY) maxY = v.y;
+            if (minZ === null || v.z < minZ) minZ = v.z;
+            if (maxZ === null || v.z > maxZ) maxZ = v.z;
+        }
+    }
+
+    minX = limitRange(minX!);
+    maxX = limitRange(maxX!);
+    minY = limitRange(minY!);
+    maxY = limitRange(maxY!);
+    minZ = limitRange(minZ!);
+    maxZ = limitRange(maxZ!);
+
+    return new Vec3((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5);
 }
 
 function getWorldPosition3D(node: Node): Vec3 {
     return node.getWorldPosition();
 }
 
+function getBoundaryOfMeshNode(node: Node): geometry.AABB | null {
+    if (!node) return null;
+    const modelComp = node.getComponent(MeshRenderer);
+    if (!modelComp) return null;
+
+    const SkinnedMeshRenderer = (cc as any).SkinnedMeshRenderer;
+    if (SkinnedMeshRenderer && modelComp instanceof SkinnedMeshRenderer) {
+        modelComp.model?.updateTransform?.(-1);
+        return modelComp.model?.worldBounds ?? null;
+    }
+
+    if (modelComp.mesh && modelComp.model) {
+        let transformAABB = modelComp.model.modelBounds?.clone() ?? null;
+        if (!transformAABB) {
+            const mesh = modelComp.mesh;
+            if (mesh && mesh.minPosition && mesh.maxPosition) {
+                transformAABB = geometry.AABB.fromPoints(geometry.AABB.create(), mesh.minPosition, mesh.maxPosition);
+            }
+        }
+        if (transformAABB) {
+            geometry.AABB.transform(transformAABB, transformAABB, node.worldMatrix);
+        }
+        return transformAABB;
+    }
+    return null;
+}
+
+// 引擎的粒子发射器形状枚举未从 cc 公开导出，这里与 Creator（utils/node.ts）一致，
+// 按其稳定的序列化值定义一个本地 ShapeType 枚举，避免使用魔法数字。
+enum ShapeType {
+    Box = 0,
+    Circle = 1,
+    Cone = 2,
+    Sphere = 3,
+    Hemisphere = 4,
+}
+
+function getRangeFromParticleComp(component: any): number {
+    let range = 0;
+    if (component.shapeModule?.enable) {
+        const shapeModule = component.shapeModule;
+        switch (shapeModule.shapeType) {
+            case ShapeType.Box:
+                range = Math.max(shapeModule.scale.x, shapeModule.scale.y, shapeModule.scale.z);
+                break;
+            case ShapeType.Circle:
+            case ShapeType.Sphere:
+            case ShapeType.Hemisphere:
+                range = shapeModule.radius;
+                break;
+            case ShapeType.Cone:
+                range = Math.max(shapeModule.radius, shapeModule.length);
+                break;
+        }
+    }
+    return range;
+}
+
+function isEditorNode(node: Node): boolean {
+    if (node.layer & Layers.Enum.GIZMOS) {
+        return true;
+    }
+
+    let iterNode: Node | null = node;
+    while (iterNode) {
+        if (iterNode.objFlags & CCObject.Flags.HideInHierarchy) {
+            return true;
+        }
+        iterNode = iterNode.parent;
+    }
+
+    return false;
+}
+
 function getMaxRangeOfNode(node: Node): number {
     let maxRange = 0.001;
-
-    if (!node) return maxRange;
-    if (node.layer & Layers.Enum.GIZMOS || node.layer & Layers.Enum.SCENE_GIZMO || node.layer & Layers.Enum.EDITOR) {
-        return maxRange;
-    }
+    if (!node || isEditorNode(node)) return maxRange;
 
     let compRange = 0;
     const components = node.components;
@@ -53,6 +267,12 @@ function getMaxRangeOfNode(node: Node): number {
             case 'cc.PointLight':
                 compRange = (component as any).range ?? 3;
                 break;
+            case 'cc.LightProbeGroup': {
+                const comp = component as any;
+                const probesSize = new Vec3(comp.maxPos).subtract(comp.minPos);
+                compRange = Math.max(Math.abs(probesSize.x / 2), Math.abs(probesSize.y / 2), Math.abs(probesSize.z / 2));
+                break;
+            }
             case 'cc.RangedDirectionalLight':
             case 'cc.DirectionalLight':
             case 'cc.Camera':
@@ -60,15 +280,30 @@ function getMaxRangeOfNode(node: Node): number {
                 break;
             case 'cc.MeshRenderer':
             case 'cc.SkinnedMeshRenderer':
+            case 'cc.AvatarModelComponent':
             case 'cc.SkinnedMeshBatchRenderer': {
                 const mr = component as MeshRenderer;
                 if (mr.mesh && mr.model) {
-                    const worldBound = mr.model.worldBounds;
-                    if (worldBound) {
-                        const he = worldBound.halfExtents;
-                        if (!Number.isNaN(he.x) && !Number.isNaN(he.y) && !Number.isNaN(he.z)) {
-                            compRange = Math.max(he.x, he.y, he.z);
+                    let worldBound: any = mr.model.worldBounds;
+
+                    if (!worldBound) {
+                        const modelBound = mr.model.modelBounds;
+                        if (modelBound) {
+                            worldBound = geometry.AABB.create();
+                            geometry.AABB.transform(worldBound, modelBound, node.worldMatrix);
                         }
+                    }
+
+                    if (worldBound && (
+                        Number.isNaN(worldBound.halfExtents.x)
+                        || Number.isNaN(worldBound.halfExtents.y)
+                        || Number.isNaN(worldBound.halfExtents.z)
+                    )) {
+                        worldBound = getBoundaryOfMeshNode(node);
+                    }
+
+                    if (worldBound) {
+                        compRange = Math.max(worldBound.halfExtents.x, worldBound.halfExtents.y, worldBound.halfExtents.z);
                     }
                 }
                 break;
@@ -105,6 +340,20 @@ function getMaxRangeOfNode(node: Node): number {
                 if (size) compRange = Math.max(size.x, size.y, size.z) / 2;
                 break;
             }
+            case 'cc.ParticleSystem': {
+                compRange = getRangeFromParticleComp(component);
+                break;
+            }
+            default: {
+                const Terrain = (cc as any).Terrain;
+                if (Terrain && className === js.getClassName(Terrain)) {
+                    const info = (component as any).info;
+                    if (info?.size) {
+                        compRange = Math.max(info.size.width / 2, info.size.height / 2);
+                    }
+                }
+                break;
+            }
         }
 
         if (compRange > maxRange) {
@@ -114,22 +363,23 @@ function getMaxRangeOfNode(node: Node): number {
         }
     }
 
-    return Math.min(Math.max(maxRange, -1e10), 1e10);
+    return limitRange(maxRange);
 }
 
 function getMaxRangeOfNodes(nodes: Node[]): number {
-    if (nodes.length === 0) return 1;
     let maxRange = Number.MIN_VALUE;
 
-    for (const node of nodes) {
-        const range = getMaxRangeOfNode(node);
-        if (range > maxRange) maxRange = range;
+    if (nodes) {
+        for (const node of nodes) {
+            let range = getMaxRangeOfNode(node);
+            if (range > maxRange) maxRange = range;
 
-        const childRange = getMaxRangeOfNodes(node.children as Node[]);
-        if (childRange > maxRange) maxRange = childRange;
+            range = getMaxRangeOfNodes(node.children as Node[]);
+            if (range > maxRange) maxRange = range;
+        }
     }
 
-    return Math.max(maxRange, 1);
+    return maxRange;
 }
 
 function makeVec3InRange(v: Vec3, min: number, max: number): void {
@@ -179,6 +429,7 @@ export class CameraController3D extends CameraControllerBase {
 
     private _curRot = new Quat();
     private _curEye = new Vec3();
+
 
     private _lineColor = new Color(85, 85, 85, 255);
 
@@ -249,10 +500,10 @@ export class CameraController3D extends CameraControllerBase {
     showGrid(visible: boolean) {
         super.showGrid(visible);
         if (this._originAxisHorizontalMeshComp?.node) {
-            this._originAxisHorizontalMeshComp.node.active = visible;
+            this._originAxisHorizontalMeshComp.node.active = visible && (this.originAxisX_Visible || this.originAxisZ_Visible);
         }
         if (this._originAxisVerticalMeshComp?.node) {
-            this._originAxisVerticalMeshComp.node.active = visible;
+            this._originAxisVerticalMeshComp.node.active = visible && this.originAxisY_Visible;
         }
     }
 
@@ -269,6 +520,19 @@ export class CameraController3D extends CameraControllerBase {
         this.originAxisZ_Visible = true;
         this._originAxisHorizontalMeshComp.node.active = (this.originAxisX_Visible || this.originAxisZ_Visible);
         this._originAxisVerticalMeshComp.node.active = this.originAxisY_Visible;
+        void this.initOriginAxisFromConfig();
+    }
+
+    private async initOriginAxisFromConfig() {
+        try {
+            const rpc = Rpc.getInstance();
+            const gizmos = await rpc.request('sceneConfigInstance', 'get', ['gizmo']) as any;
+            if (gizmos?.originAxis3D) {
+                this.updateOriginAxisByConfig(gizmos.originAxis3D, false);
+            }
+        } catch {
+            // Use the default 3D origin axes when config is unavailable.
+        }
     }
 
     updateOriginAxisByConfig(config: { x?: boolean; y?: boolean; z?: boolean }, update = true) {
@@ -277,10 +541,10 @@ export class CameraController3D extends CameraControllerBase {
         if (config.z !== undefined) this.originAxisZ_Visible = config.z;
 
         if (this._originAxisHorizontalMeshComp?.node) {
-            this._originAxisHorizontalMeshComp.node.active = (this.originAxisX_Visible || this.originAxisZ_Visible);
+            this._originAxisHorizontalMeshComp.node.active = !!this._gridMeshComp?.node?.active && (this.originAxisX_Visible || this.originAxisZ_Visible);
         }
         if (this._originAxisVerticalMeshComp?.node) {
-            this._originAxisVerticalMeshComp.node.active = this.originAxisY_Visible;
+            this._originAxisVerticalMeshComp.node.active = !!this._gridMeshComp?.node?.active && this.originAxisY_Visible;
         }
 
         if (update) {
@@ -315,8 +579,6 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     private updateOriginAxisVertical() {
-        if (!this._originAxisVerticalMeshComp?.node?.active) return;
-
         const { startY, endY, cameraPos } = this.getOriginAxisData();
         const positions: number[] = [];
         const colors: number[] = [];
@@ -344,8 +606,6 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     private updateOriginAxisHorizontal() {
-        if (!this._originAxisHorizontalMeshComp?.node?.active) return;
-
         const { startY, endY, startX, endX, cameraPos } = this.getOriginAxisData();
         const positions: number[] = [];
         const colors: number[] = [];
@@ -438,8 +698,8 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     // ---------- 模式切换 ----------
-
     changeMode(modeCommand: ModeCommand) {
+        if (!this._modeFSM) return;
         this._modeFSM.issueCommand(modeCommand);
         let mode = CameraMoveMode.IDLE;
         switch (modeCommand) {
@@ -505,11 +765,6 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     // ---------- 焦点 ----------
-
-    isMoving(): boolean {
-        return this._modeFSM.currentState !== this._idleMode;
-    }
-
     private focusByNode(nodes: Node[], notChangeDist = true, immediate = false) {
         if (nodes.length === 0) return;
 
@@ -527,22 +782,16 @@ export class CameraController3D extends CameraControllerBase {
 
         if (!notChangeDist) {
             if (this._camera.projection === PERSPECTIVE) {
-                const camWidth = this._camera.camera?.width;
-                const camHeight = this._camera.camera?.height;
-                if (camWidth && camHeight) {
-                    const length = Math.min(camWidth, camHeight) / 2;
-                    const A = new Vec3(0, 0, 1);
-                    const B = new Vec3(length, 0, 1);
-                    const worldA = new Vec3();
-                    this._camera.screenToWorld(A, worldA);
-                    const worldB = new Vec3();
-                    this._camera.screenToWorld(B, worldB);
-                    const disWorld = worldA.subtract(worldB).length();
-                    dist = Math.max((maxRange / length) * disWorld, this.near * 1.3);
-                    dist = Math.min(dist, this.far * 0.9);
-                } else {
-                    dist = Math.max(maxRange * 2.5, 1);
-                }
+                const A = new Vec3(0, 0, 1);
+                const length = Math.min(this._camera.camera.width, this._camera.camera.height) / 2;
+                const B = new Vec3(length, 0, 1);
+                const worldA = new Vec3(0, 0, 0);
+                this._camera?.screenToWorld(A, worldA);
+                const worldB = new Vec3(0, 0, 0);
+                this._camera?.screenToWorld(B, worldB);
+                const disWorld = worldA.subtract(worldB).length();
+                dist = Math.max((maxRange / length) * disWorld, this.near * 1.3);
+                dist = Math.min(dist, this.far * 0.9);
             } else if (this._camera.projection === ORTHO) {
                 const depthSize = (this._camera.fov / 180) * Math.PI * this._camera.orthoHeight;
                 dist = ((maxRange * depthSize) / this._camera.orthoHeight) * 13;
@@ -761,12 +1010,27 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     // ---------- 鼠标/键盘事件 ----------
+    isMoving(): boolean {
+        return this._modeFSM?.currentState !== this._idleMode;
+    }
 
     onMouseDBlDown(event: ISceneMouseEvent) {
+        if (!this._modeFSM) return;
+        const isViewMode = !!Service.Gizmo?.isViewMode;
+        if (isViewMode) {
+            const x = event.x;
+            const y = getMainWindowSize().height - event.y;
+            let results = getRaycastResultsForSnap(this._camera, x, y);
+            results = results.filter(result => !(result.node.objFlags & CCObject.Flags.HideInHierarchy)) as typeof results;
+            if (results.length > 0) {
+                this.focusByXY(results[0].hitPoint);
+            }
+        }
         return (this._modeFSM.currentState as ModeBase3D).onMouseDBlDown(event);
     }
 
     onMouseDown(event: ISceneMouseEvent) {
+        if (!this._modeFSM) return;
         this.altKey = event.altKey;
         this.shiftKey = event.shiftKey;
         this.mousePressing = true;
@@ -786,6 +1050,7 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     onMouseMove(event: ISceneMouseEvent) {
+        if (!this._modeFSM) return;
         this.shiftKey = event.shiftKey;
         this.altKey = event.altKey;
 
@@ -803,6 +1068,7 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     onMouseUp(event: ISceneMouseEvent) {
+        if (!this._modeFSM) return;
         this.mousePressing = false;
 
         const isViewMode = !!Service.Gizmo?.isViewMode;
@@ -824,6 +1090,7 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     onMouseWheel(event: ISceneMouseEvent) {
+        if (!this._modeFSM) return;
         if ((this._modeFSM.currentState as ModeBase3D).modeName !== CameraMoveMode.WANDER) {
             let deltaY = event.deltaY;
             if (Math.abs(deltaY - this.lastMouseWheelDeltaY) > this.maxMouseWheelDeltaY) {
@@ -837,6 +1104,7 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     onKeyDown(event: ISceneKeyboardEvent) {
+        if (!this._modeFSM) return;
         this.shiftKey = event.shiftKey;
         this.altKey = event.altKey;
 
@@ -857,6 +1125,7 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     onKeyUp(event: ISceneKeyboardEvent) {
+        if (!this._modeFSM) return;
         this.shiftKey = event.shiftKey;
         this.altKey = event.altKey;
 
@@ -882,6 +1151,7 @@ export class CameraController3D extends CameraControllerBase {
     }
 
     onUpdate(deltaTime: number) {
+        if (!this._modeFSM) return;
         (this._modeFSM.currentState as ModeBase3D).onUpdate(deltaTime);
     }
 

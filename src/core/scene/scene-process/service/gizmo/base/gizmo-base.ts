@@ -1,4 +1,13 @@
 import { Node, Component } from 'cc';
+import { NodeEventType, type IUndoScope } from '../../../../common';
+import {
+    broadcastAnimationPropertyCommitted,
+    normalizeAnimationPropertyCommitPath,
+} from '../../animation/property-commit-event';
+
+type BroadcastService = {
+    broadcast?(event: string, ...args: unknown[]): void;
+};
 
 /**
  * 获取 Service（惰性访问，避免循环依赖）
@@ -12,10 +21,29 @@ function getService(): any {
     }
 }
 
+/**
+ * 获取全局事件总线（惰性访问，避免循环依赖）。
+ * 广播事件必须走 ServiceEvents，而不是 getService()：后者返回的是 Service 注册表 Proxy，
+ * 其 get 陷阱对未注册的名字（如 'broadcast'）会 throw，`?.` 挡不住抛错，导致事件永远发不出去。
+ */
+function getServiceEvents(): any {
+    try {
+        const { ServiceEvents } = require('../../core/global-events');
+        return ServiceEvents;
+    } catch (e) {
+        return null;
+    }
+}
+
 class GizmoBase<T extends Component = Component> {
     private _hidden = true;
     private _target: T | null;
     protected _isInitialized = false;
+    /**
+     * Synchronous control lifecycle state shared with derived gizmos during teardown.
+     * Keep resets of these flags before any asynchronous Undo finalization so hide,
+     * destroy, target replacement, and mouse-up cannot finish the same drag twice.
+     */
     protected _isControlBegin = false;
     protected _recorded = false;
     protected _nodeSelected = false;
@@ -80,8 +108,8 @@ class GizmoBase<T extends Component = Component> {
         this._isControlBegin = true;
         this.recordChanges(propPath);
         try {
-            const svc = getService();
-            svc?.broadcast?.('gizmo:control-begin', propPath);
+            const svcEvents = getServiceEvents();
+            svcEvents?.broadcast?.('gizmo:control-begin', propPath);
         } catch (e) {
             // not ready
         }
@@ -93,15 +121,19 @@ class GizmoBase<T extends Component = Component> {
         }
     }
 
-    onControlEnd(propPath: string | null) {
+    async onControlEnd(propPath: string | null) {
         this._isControlBegin = false;
-        this.commitChanges();
+        // Gizmo 可能在异步 Undo 提交完成前因为选择切换、组件删除或场景关闭
+        // 被解绑。提前保存稳定的节点路径，避免提交后再读取空的 this.nodes。
+        const animationCommitNodePaths = this.collectAnimationPropertyCommitNodePaths(propPath);
+        await this.commitChanges();
         try {
-            const svc = getService();
-            svc?.broadcast?.('gizmo:control-end', propPath);
+            const svcEvents = getServiceEvents();
+            svcEvents?.broadcast?.('gizmo:control-end', propPath);
         } catch (e) {
-            // not ready
+            console.warn('[Gizmo] Failed to broadcast legacy control-end event:', e);
         }
+        this.broadcastAnimationPropertyCommitted(propPath, animationCommitNodePaths);
     }
 
     recordChanges(propPath?: string | null) {
@@ -111,6 +143,7 @@ class GizmoBase<T extends Component = Component> {
                 const svc = getService();
                 this.undoID = svc?.Undo?.beginRecording?.(uuids, {
                     label: propPath ? `Gizmo ${propPath}` : 'Gizmo Change',
+                    scope: this.createRecordingScope(propPath),
                 }) ?? '';
             } catch (e) {
                 this.undoID = '';
@@ -119,18 +152,40 @@ class GizmoBase<T extends Component = Component> {
         }
     }
 
-    commitChanges() {
+    async commitChanges() {
+        // This reset is intentionally synchronous. Derived gizmos may inspect
+        // `_recorded` while another teardown path is awaiting endRecording().
         this._recorded = false;
-        if (this.undoID !== '') {
-            const undoID = this.undoID;
+        const undoID = this.undoID;
+        // 在等待异步 endRecording 前先释放当前 ID。销毁、隐藏或快速切换目标
+        // 可能再次触发 commitChanges；提前清空可避免重复结束旧事务，也不会让
+        // 旧事务完成后覆盖期间新建的 recording ID。
+        this.undoID = '';
+        if (undoID !== '') {
             try {
                 const svc = getService();
-                void svc?.Undo?.endRecording?.(undoID)?.catch?.((_error: unknown) => {});
+                await svc?.Undo?.endRecording?.(undoID);
             } catch (e) {
-                // 服务还没初始化完成。
+                console.warn('[Gizmo] Failed to end undo recording:', e);
             }
         }
-        this.undoID = '';
+    }
+
+    private createRecordingScope(propPath?: string | null): IUndoScope | undefined {
+        const nodes = this.nodes;
+        if (!propPath || nodes.length !== 1) {
+            return undefined;
+        }
+        const EditorExtends = (cc as any).EditorExtends || (globalThis as any).EditorExtends;
+        const nodePath = EditorExtends?.Node?.getNodePath?.(nodes[0]);
+        if (!nodePath) {
+            return undefined;
+        }
+        return {
+            editorType: 'scene',
+            nodePath,
+            propPath: normalizeAnimationPropertyCommitPath(propPath),
+        };
     }
 
     public checkVisible(): boolean {
@@ -156,7 +211,7 @@ class GizmoBase<T extends Component = Component> {
         // 这种情况下 onControlEnd 不会触发，所以这里主动结束录制，
         // 避免该节点一直被认为正在录制，导致后续修改不再记录 undo。
         // 没有开始录制时，commitChanges 不会产生额外影响。
-        this.commitChanges();
+        void this.commitChanges();
         if (this.onDestroy) {
             this.onDestroy();
         }
@@ -187,18 +242,59 @@ class GizmoBase<T extends Component = Component> {
         }
     }
 
-    getCompPropPath(propName: string) {
+    getCompPropPath(propName: string): string | null {
         const target = this.target;
         if (target) {
             const node = target.node;
-            const compIdx = (node as any)['_components'].indexOf(target);
+            const components = (node as any)['_components'] as Component[] | undefined;
+            const compIdx = components?.indexOf(target) ?? -1;
+            if (compIdx < 0) {
+                return null;
+            }
             return '_components.' + compIdx + '.' + propName;
         }
         return null;
     }
 
-    protected onComponentChanged(_node: Node) {
-        // broadcast node change（CLI 中暂不实现）
+    private collectAnimationPropertyCommitNodePaths(propPath: string | null): string[] {
+        if (!propPath) {
+            return [];
+        }
+        const EditorExtends = (cc as any).EditorExtends || (globalThis as any).EditorExtends;
+        const nodePaths: string[] = [];
+        for (const node of this.nodes) {
+            try {
+                const nodePath = EditorExtends?.Node?.getNodePath?.(node);
+                if (nodePath) {
+                    nodePaths.push(nodePath);
+                }
+            } catch (e) {
+                console.warn('[Gizmo] Failed to capture animation property commit target:', e);
+            }
+        }
+        return nodePaths;
+    }
+
+    private broadcastAnimationPropertyCommitted(propPath: string | null, nodePaths: readonly string[]): void {
+        if (!propPath) {
+            return;
+        }
+        for (const nodePath of nodePaths) {
+            broadcastAnimationPropertyCommitted({
+                nodePath,
+                propPath,
+                source: 'engine',
+            });
+        }
+    }
+
+    protected onComponentChanged(node: Node) {
+        try {
+            const svcEvents = getServiceEvents();
+            svcEvents?.emit?.('node:change', node, { type: NodeEventType.COMPONENT_CHANGED });
+        } catch (e) {
+            console.warn('[Gizmo] Failed to emit component change event:', e);
+        }
     }
 
     public onEditorCameraMoved() {}
