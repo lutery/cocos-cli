@@ -119,7 +119,9 @@ export async function run(platform: string, dest: string) {
 export function injectBridgeScripts(html: string, options: IWebBridgeScriptOptions): string {
     const normalizedBridgeLink = String(options.bridgeLink || '').trim();
     if (!normalizedBridgeLink) {
-        throw new Error('Missing web bridge script link');
+        // Plain local builds have no OpenPaaS publish config — nothing to inject, not an error.
+        // (Throwing here broke every non-publish web build; see fix/deserialize-internal.)
+        return html;
     }
 
     const token = randomBytes(32).toString('hex');
