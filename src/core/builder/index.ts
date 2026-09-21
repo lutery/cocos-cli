@@ -212,6 +212,27 @@ function readBuildOptionsForBuildStage(options: IBuildStageOptions) {
     return buildOptions;
 }
 
+/**
+ * Options for actually executing a stage task.
+ * Differs from readBuildOptionsForBuildStage only for web platforms: their stages never persist
+ * cocos.compile.config.json (requiredBuildOptions: false), yet a stale/user-provided file may
+ * exist — use it when readable, synthesize minimal options when it is missing.
+ */
+function readBuildOptionsForExecute(options: IBuildStageOptions) {
+    if (!options.platform.startsWith('web')) {
+        return readBuildOptionsForBuildStage(options);
+    }
+    options.dest = utils.Path.resolveToRaw(options.dest);
+    let buildOptions;
+    try {
+        buildOptions = readBuildTaskOptions(options.dest);
+    } catch {
+        buildOptions = { platform: options.platform, packages: {} } as any;
+    }
+    mergeBuildStageRuntimeOptions(buildOptions, options);
+    return buildOptions;
+}
+
 function mergeBuildStageRuntimeOptions(buildOptions: IBuildTaskOption<any>, options: IBuildStageOptions) {
     buildOptions.platform = options.platform;
     (buildOptions as IBuildTaskOption<any> & { dest?: string }).dest = options.dest;
@@ -242,10 +263,9 @@ export async function executeBuildStageTask(taskId: string, stageName: string, o
     try {
         options.dest = utils.Path.resolveToRaw(options.dest);
         // Web platforms no longer emit cocos.compile.config.json (requiredBuildOptions: false),
-        // so synthesize minimal options instead of reading — same rule as
-        // readBuildOptionsForBuildStage, which executeBuildStageTask had missed (breaks `cocos run`).
-        // Note: the helper already applies mergeBuildStageRuntimeOptions.
-        const buildOptions = readBuildOptionsForBuildStage(options);
+        // so execution must synthesize minimal options instead of hard-requiring the file —
+        // this is what executeBuildStageTask had missed (breaks `cocos run`).
+        const buildOptions = readBuildOptionsForExecute(options);
         let result: IBuildResultData;
         if (shouldCascadeBuildStage(options, buildOptions)) {
             result = await executeBuildStageTaskCascade(taskId, stageName, options, buildOptions, onProgress, restoreLogSink);

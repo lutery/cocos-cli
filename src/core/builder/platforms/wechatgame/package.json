@@ -1,0 +1,16 @@
+{
+    "name": "wechatgame",
+    "version": "1.0.0",
+    "author": "Cocos",
+    "description": "WeChat Mini Game platform plugin",
+    "license": "ISC",
+    "type": "commonjs",
+    "contributes": {
+        "builder": {
+            "register": true,
+            "platform": "wechatgame",
+            "config": "./src/config",
+            "hooks": "./src/hooks"
+        }
+    }
+}

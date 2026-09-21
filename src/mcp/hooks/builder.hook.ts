@@ -3,7 +3,7 @@ import { join, resolve } from 'path';
 import { existsSync, readdirSync, readFileSync } from 'fs';
 import { SchemaBuildBaseOption, SchemaKnownBuildOptions, SchemaOtherPlatformBuildOption } from '../../api/builder/schema';
 
-const KNOWN_BUILD_PLATFORMS = ['web-desktop', 'web-mobile', 'android', 'ios', 'windows', 'mac', 'ohos', 'harmonyos-next', 'google-play', 'huawei-agc'];
+const KNOWN_BUILD_PLATFORMS = ['web-desktop', 'web-mobile', 'wechatgame', 'android', 'ios', 'windows', 'mac', 'ohos', 'harmonyos-next', 'google-play', 'huawei-agc'];
 
 export class BuilderHook {
     private dynamicPlatforms: string[] = [];

@@ -33,7 +33,7 @@ export const SchemaBundleConfig = z.object({
 }).describe('Bundle Configuration Options'); // Bundle 配置选项
 
 // Platform Enum - Accepts any string, built-in platform names are for reference only // 平台枚举 - 接受任意字符串，内置平台名称仅作为参考
-export const SchemaPlatform = z.string().default('web-mobile').describe('Platform Identifier (e.g., web-desktop, web-mobile, windows, mac, ios, android, ohos, google-play, harmonyos-next etc.)'); // 平台标识符 (如: web-desktop, web-mobile, windows, mac, ios, android, ohos, harmonyos-next 等)
+export const SchemaPlatform = z.string().default('web-mobile').describe('Platform Identifier (e.g., web-desktop, web-mobile, wechatgame, windows, mac, ios, android, ohos, google-play, harmonyos-next etc.)'); // 平台标识符 (如: web-desktop, web-mobile, wechatgame, windows, mac, ios, android, ohos, harmonyos-next 等)
 export const SchemaPlatformCanMake = z.string().describe('Platform Identifier supported for compilation (e.g., windows, mac, ios, android, google-play etc.)'); // 支持编译的平台标识符 (如: windows, mac, ios, android 等)
 export const SchemaBuildTemplateName = z.string().min(1).describe('Platform identifier or build template display name used to create a build template');
 
@@ -132,6 +132,18 @@ export const SchemaHuaweiAgcPackage = z.object({
     serviceConfigPath: z.string().optional()
         .describe('Path to agconnect-services.json; the package name is read from this file at build time'), // agconnect-services.json 路径，包名在构建时从该文件读取
 }).describe('Huawei AGC platform specific configuration'); // Huawei AGC平台特定配置
+
+// WeChat Mini Game Packages Configuration // 微信小游戏 Packages 配置
+export const SchemaWeChatGamePackage = z.object({
+    appid: z.string().optional()
+        .describe('WeChat appid; leave empty to use the tourist appid (DevTools preview only)'), // 微信 AppID，留空则使用游客 AppID
+    orientation: z.enum(['portrait', 'landscape']).optional()
+        .describe('Device orientation written into game.json'), // 写入 game.json 的屏幕方向
+    useWebgl2: z.boolean().optional()
+        .describe('Probe WebGL2 in the first screen and report it to the engine (falls back to WebGL1)'), // 启动屏探测 WebGL2 并告知引擎
+    wechatToolsPath: z.string().optional()
+        .describe('WeChat DevTools cli or install directory used by the run stage'), // Run 阶段使用的微信开发者工具路径
+}).describe('WeChat Mini Game platform specific configuration'); // 微信小游戏平台特定配置
 
 // ==================== Basic Build Configuration ==================== // 基础构建配置
 
@@ -331,6 +343,18 @@ export const SchemaMacBuildOption = SchemaBuildBaseOption
     })
     .describe('Mac Platform Build Options'); // Mac平台构建选项
 
+// WeChat Mini Game Build Options // 微信小游戏构建选项
+export const SchemaWeChatGameBuildOption = SchemaBuildBaseOption
+    .extend({
+        platform: z.literal('wechatgame').describe('Build Platform'), // 构建平台
+        packages: z.object({
+            wechatgame: SchemaWeChatGamePackage
+                .catchall(z.any())  // 允许其他任意字段
+                .optional()
+        }).optional().describe('WeChat Mini Game Platform Configuration') // 微信小游戏平台配置（可省略，全部选项均有默认值）
+    })
+    .describe('WeChat Mini Game Platform Build Options'); // 微信小游戏平台构建选项
+
 
 // Other Platform Build Options (Generic) // 其他平台构建选项（通用）
 export const SchemaOtherPlatformBuildOption = SchemaBuildBaseOption
@@ -350,7 +374,8 @@ export const SchemaKnownBuildOptions = [
     SchemaOhosBuildOption,
     SchemaHarmonyOSNextBuildOption,
     SchemaGooglePlayBuildOption,
-    SchemaHuaweiAgcBuildOption
+    SchemaHuaweiAgcBuildOption,
+    SchemaWeChatGameBuildOption
 ];
 
 // ==================== Create discriminatedUnion ==================== //
@@ -444,6 +469,7 @@ export const SchemaBuildConfigResult = z.union([
     SchemaHarmonyOSNextBuildOption.omit({ configPath: true, skipCheck: true, taskId: true, taskName: true, logDest: true }),
     SchemaGooglePlayBuildOption.omit({ configPath: true, skipCheck: true, taskId: true, taskName: true, logDest: true }),
     SchemaHuaweiAgcBuildOption.omit({ configPath: true, skipCheck: true, taskId: true, taskName: true, logDest: true }),
+    SchemaWeChatGameBuildOption.omit({ configPath: true, skipCheck: true, taskId: true, taskName: true, logDest: true }),
     SchemaOtherPlatformBuildOption.omit({ configPath: true, skipCheck: true, taskId: true, taskName: true, logDest: true }),
 ]).nullable().describe('Build configuration query result (all fields required, including packages)'); // 构建配置查询结果（所有字段必填，包含 packages）
 

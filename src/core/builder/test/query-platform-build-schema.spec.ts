@@ -236,20 +236,26 @@ describe('PluginManager platform config schema queries', () => {
 
         const [result] = pm.queryPlatformConfig();
 
+        // Built-in platform packages always sort before externally registered plugins
+        // (see PluginManager.sortPkgNameWidthPriority) — now that `wechatgame` is a built-in
+        // platform, its own `make` stage precedes the external `custom` deploy stage even though
+        // the external package has the higher priority number.
         expect(result.customBuildStages).toEqual([{
+            name: 'make',
+            displayName: 'Make',
+            description: 'Make Description',
+            hook: 'make',
+        }, {
             name: 'deploy',
             displayName: 'Deploy',
             description: 'Deploy Description',
             hook: 'deploy',
             hidden: true,
-        }, {
-            name: 'make',
-            displayName: 'Make',
-            description: 'Make Description',
-            hook: 'make',
         }]);
 
-        result.customBuildStages![0].displayName = 'Changed';
+        // The query result must be a deep clone: mutating it must not affect the stored config.
+        const deployInResult = result.customBuildStages!.find((stage) => stage.name === 'deploy')!;
+        deployInResult.displayName = 'Changed';
         expect((pm as any).customBuildStages[TEST_PLATFORM].custom[0].displayName).toBe('Deploy');
     });
 
