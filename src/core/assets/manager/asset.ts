@@ -8,10 +8,12 @@ import assetQuery, { ASSET_TREE_INFO_DATA_KEYS } from './query';
 import assetOperation from './operation';
 import assetHandlerManager from './asset-handler';
 import animationGraphVariant from '../animation-graph-variant';
+import animationGraph from '../animation-graph-service';
 import * as serializedData from '../serialized-data';
 import * as materialService from '../material-service';
 import {
     extractImagePixelsFromFile,
+    resolveImageSourceFile,
     type IExtractedImagePixels,
     type IImagePixelExtractionOptions,
 } from '../image-processing';
@@ -47,6 +49,7 @@ class AssetManager extends EventEmitter {
     saveAsset = assetOperation.saveAsset.bind(assetOperation);
     createAsset = assetOperation.createAsset.bind(assetOperation);
     refreshAsset = assetOperation.refreshAsset.bind(assetOperation);
+    refreshAssetOnly = assetOperation.refreshAssetOnly.bind(assetOperation);
     reimportAsset = assetOperation.reimportAsset.bind(assetOperation);
     renameAsset = assetOperation.renameAsset.bind(assetOperation);
     removeAsset = assetOperation.removeAsset.bind(assetOperation);
@@ -62,6 +65,20 @@ class AssetManager extends EventEmitter {
     queryMaterialEffect = materialService.queryEffect;
     queryMaterialAllEffects = materialService.queryAllEffects;
     saveMaterial = materialService.saveMaterial;
+
+    // ---------- animation graph ----------
+    queryAnimationGraph = animationGraph.query.bind(animationGraph);
+    queryAnimationGraphInspector = animationGraph.queryInspector.bind(animationGraph);
+    queryAnimationGraphMotionPreviewData = animationGraph.queryMotionPreviewData.bind(animationGraph);
+    queryAnimationGraphPoseGraphAssetDragHandlers = animationGraph.queryPoseGraphAssetDragHandlers.bind(animationGraph);
+    queryAnimationGraphStateMachineComponentTypes = animationGraph.queryStateMachineComponentTypes.bind(animationGraph);
+    setAnimationGraphInspectorProperty = animationGraph.setInspectorProperty.bind(animationGraph);
+    resetAnimationGraphInspectorProperty = animationGraph.resetInspectorProperty.bind(animationGraph);
+    createAnimationGraphInspectorProperty = animationGraph.createInspectorProperty.bind(animationGraph);
+    executeAnimationGraphCommand = animationGraph.execute.bind(animationGraph);
+    saveAnimationGraph = animationGraph.save.bind(animationGraph);
+    reloadAnimationGraph = animationGraph.reload.bind(animationGraph);
+    onAnimationGraphChanged = animationGraph.onChanged.bind(animationGraph);
 
     // ---------- animation graph variant ---------
     queryAnimationGraphVariant = animationGraphVariant.query.bind(animationGraphVariant);
@@ -86,11 +103,15 @@ class AssetManager extends EventEmitter {
         urlOrUUIDOrPath: string,
         options: IImagePixelExtractionOptions,
     ): Promise<IExtractedImagePixels | null> {
-        const assetInfo = this.queryAssetInfo(urlOrUUIDOrPath);
-        if (!assetInfo?.file) {
+        const asset = this.queryAsset(urlOrUUIDOrPath);
+        if (!asset) {
             return null;
         }
-        return extractImagePixelsFromFile(assetInfo.file, options);
+        const file = resolveImageSourceFile(asset);
+        if (!file) {
+            return null;
+        }
+        return extractImagePixelsFromFile(file, options);
     }
 
     getEffectBinPath() {
@@ -379,6 +400,7 @@ export interface TypedAssetManager extends EventEmitter {
     saveAsset: typeof assetOperation.saveAsset;
     createAsset: typeof assetOperation.createAsset;
     refreshAsset: typeof assetOperation.refreshAsset;
+    refreshAssetOnly: typeof assetOperation.refreshAssetOnly;
     reimportAsset: typeof assetOperation.reimportAsset;
     renameAsset: typeof assetOperation.renameAsset;
     removeAsset: typeof assetOperation.removeAsset;
@@ -394,6 +416,19 @@ export interface TypedAssetManager extends EventEmitter {
     queryMaterialEffect: typeof materialService.queryEffect;
     queryMaterialAllEffects: typeof materialService.queryAllEffects;
     saveMaterial: typeof materialService.saveMaterial;
+
+    queryAnimationGraph: typeof animationGraph.query;
+    queryAnimationGraphInspector: typeof animationGraph.queryInspector;
+    queryAnimationGraphMotionPreviewData: typeof animationGraph.queryMotionPreviewData;
+    queryAnimationGraphPoseGraphAssetDragHandlers: typeof animationGraph.queryPoseGraphAssetDragHandlers;
+    queryAnimationGraphStateMachineComponentTypes: typeof animationGraph.queryStateMachineComponentTypes;
+    setAnimationGraphInspectorProperty: typeof animationGraph.setInspectorProperty;
+    resetAnimationGraphInspectorProperty: typeof animationGraph.resetInspectorProperty;
+    createAnimationGraphInspectorProperty: typeof animationGraph.createInspectorProperty;
+    executeAnimationGraphCommand: typeof animationGraph.execute;
+    saveAnimationGraph: typeof animationGraph.save;
+    reloadAnimationGraph: typeof animationGraph.reload;
+    onAnimationGraphChanged: typeof animationGraph.onChanged;
 
     queryAnimationGraphVariant: typeof animationGraphVariant.query;
     changeAnimationGraphVariant: typeof animationGraphVariant.change;

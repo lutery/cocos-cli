@@ -5,6 +5,9 @@ import { ProcessRPC } from '../process-rpc';
 import { sceneConfigInstance } from '../scene-configs';
 import { referenceImageFiles } from './reference-image-files';
 import { referenceImageStore } from './reference-image-store';
+import { lightFXBakeHost } from './lightfx-bake-host';
+import { reflectionProbeRenderer } from './reflection-probe-renderer';
+import { reflectionProbeBakeHost } from './reflection-probe-bake-host';
 
 export interface SceneHostModules {
     assetManager: typeof assetManager;
@@ -13,6 +16,9 @@ export interface SceneHostModules {
     i18n: typeof i18n;
     referenceImageFiles: typeof referenceImageFiles;
     referenceImageStore: typeof referenceImageStore;
+    lightFXBakeHost: typeof lightFXBakeHost;
+    reflectionProbeRenderer: typeof reflectionProbeRenderer;
+    reflectionProbeBakeHost: typeof reflectionProbeBakeHost;
 }
 
 const defaultSceneHostModules: SceneHostModules = {
@@ -23,6 +29,11 @@ const defaultSceneHostModules: SceneHostModules = {
     // Feature-owned Node modules: external file reads and serialized local configuration writes.
     referenceImageFiles,
     referenceImageStore,
+    // Native LightFX execution, filesystem staging and Asset DB transactions stay in Node.
+    lightFXBakeHost,
+    reflectionProbeRenderer,
+    // Filesystem writes, native cmft execution and output transactions must never run in a Webview.
+    reflectionProbeBakeHost,
 };
 
 /** Registers the default host modules with the specified Scene RPC transport. */
@@ -51,5 +62,11 @@ export class SceneHostLocalExecutor {
 
     public dispose(): void {
         this.rpc.dispose();
+        void this.modules.lightFXBakeHost.dispose().catch((error) => {
+            console.error('[Node] Failed to dispose the LightFX bake host:', error);
+        });
+        void this.modules.reflectionProbeBakeHost.dispose().catch((error) => {
+            console.error('[Node] Failed to dispose the reflection-probe bake host:', error);
+        });
     }
 }

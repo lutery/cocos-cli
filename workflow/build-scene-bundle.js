@@ -42,7 +42,7 @@ async function buildSceneBundle() {
                         'fs', 'node:fs', 'fs-extra', 'graceful-fs', 'lodash', 'package.json', '@cocos/asset-db',
                         'constants', 'stream', 'assert', 'crypto', 'child_process', 'vm', 'buffer',
                         'tty', 'zlib', 'http', 'https', 'net', 'tls', 'dns', 'readline', 'punycode',
-                        'cc/mods-mgr', 'inherits', 'sys', 'url', 'process', 'proper-lockfile'
+                        'cc/mods-mgr', 'inherits', 'sys', 'url', 'process', 'proper-lockfile', 'sharp'
                     ];
                     if (stubs.includes(id)) {
                         return '\0smart-' + id;
@@ -402,7 +402,7 @@ async function buildSceneBundle() {
     });
 
     const bundleOutputFile = path.join(workspaceDir, 'static', 'web', 'scene-bundle.js');
-    await bundle.write({
+    const sceneBundleOutput = await bundle.write({
         file: bundleOutputFile,
         format: 'system',
         sourcemap: true,
@@ -435,6 +435,14 @@ async function buildSceneBundle() {
 })();
         `
     });
+
+    const unexpectedImports = sceneBundleOutput.output
+        .filter((item) => item.type === 'chunk')
+        .flatMap((item) => item.imports)
+        .filter((id) => id !== 'cc');
+    if (unexpectedImports.length) {
+        throw new Error(`Scene Web bundle contains unsupported external imports: ${[...new Set(unexpectedImports)].join(', ')}`);
+    }
 
     console.log('[Build] Successfully bundled to', bundleOutputFile);
 }

@@ -19,7 +19,8 @@ const mockQueryUrl = jest.fn();
 const mockAssetQueryUrl = jest.fn();
 const mockRefresh = jest.fn(async (_pathOrUrlOrUUID: string) => 0);
 const mockReimport = jest.fn();
-const mockAddTask = jest.fn(async (func: Function, args: any[]) => await func(...args));
+const mockAddTask = jest.fn(async (func: (...args: any[]) => unknown, args: any[]) => await func(...args));
+const mockAutoRefreshAssetLazy = jest.fn();
 const mockGetCreateMenuByName = jest.fn();
 const mockCreateAssetByHandler = jest.fn();
 const mockSaveAssetByHandler = jest.fn();
@@ -98,8 +99,8 @@ jest.mock('../manager/asset-copy', () => ({
 jest.mock('../manager/asset-db', () => ({
     __esModule: true,
     default: {
-        addTask: (func: Function, args: any[]) => mockAddTask(func, args),
-        autoRefreshAssetLazy: jest.fn(),
+        addTask: (func: (...args: any[]) => unknown, args: any[]) => mockAddTask(func, args),
+        autoRefreshAssetLazy: (...args: any[]) => mockAutoRefreshAssetLazy(...args),
         assetDBInfo: {},
         assetDBMap: {},
     },
@@ -204,6 +205,8 @@ describe('asset operation filesystem bridge', () => {
     });
 
     afterEach(() => {
+        const assetQuery = require('../manager/query').default as typeof import('../manager/query').default;
+        delete (assetQuery as any).queryAssets;
         jest.restoreAllMocks();
     });
 
@@ -279,8 +282,39 @@ describe('asset operation filesystem bridge', () => {
 
         expect(mockReimport).toHaveBeenCalledTimes(1);
         expect(mockReimport).toHaveBeenCalledWith(requestPath);
-        expect(mockQueryAsset).not.toHaveBeenCalled();
+        // The Animation Graph dirty-write guard performs one preflight lookup. A
+        // second lookup would indicate that reimport entered its busy retry path.
+        expect(mockQueryAsset).toHaveBeenCalledTimes(1);
+        expect(mockQueryAsset).toHaveBeenCalledWith(requestPath);
         expect(result).toEqual({ source: asset.source });
+    });
+
+    it('scopes Animation Graph preflight queries to the requested database root', () => {
+        const { assetOperation } = require('../manager/operation') as typeof import('../manager/operation');
+        const assetQuery = require('../manager/query').default as typeof import('../manager/query').default;
+        const assetsGraph = {
+            uuid: 'assets-graph',
+            source: 'D:/project/assets/graph.animgraph',
+            url: 'db://assets/graph.animgraph',
+            meta: { importer: 'animation-graph' },
+        };
+        const internalGraph = {
+            uuid: 'internal-graph',
+            source: 'D:/project/internal/graph.animgraph',
+            url: 'db://internal/graph.animgraph',
+            meta: { importer: 'animation-graph' },
+        };
+        mockQueryAsset.mockReturnValue({
+            uuid: 'db://assets',
+            source: 'db://assets',
+            meta: { importer: 'database', name: 'assets' },
+        });
+        (assetQuery as any).queryAssets = jest.fn(() => [assetsGraph, internalGraph]);
+
+        const result = (assetOperation as any)._queryAnimationGraphAssetsAt('db://assets');
+
+        expect(result).toEqual([assetsGraph]);
+        expect((assetQuery as any).queryAssets).toHaveBeenCalledTimes(1);
     });
 
     it('reimportAsset serializes the asset tree metadata contract', async () => {
@@ -431,6 +465,30 @@ describe('asset operation filesystem bridge', () => {
         await assetOperation.moveAsset(source, target);
 
         expect(mockMoveAssetSource).toHaveBeenCalledWith(source, target, undefined);
+    });
+
+    it('moveAsset rejects without refreshing the database when the source move fails', async () => {
+        const { assetOperation } = require('../manager/operation') as typeof import('../manager/operation');
+        const source = 'D:/project/assets/source.txt';
+        const target = 'D:/project/assets/folder/source.txt';
+        mockQueryAsset.mockReturnValue({
+            source,
+            _parent: null,
+            isDirectory: () => false,
+            _assetDB: { options: { readonly: false } },
+            url: 'db://assets/source.txt',
+        });
+        mockExistsSync.mockReturnValue(false);
+        mockQueryUrl.mockReturnValue('db://assets/folder/source.txt');
+        const error = new Error('source move failed');
+        mockMoveAssetSource.mockRejectedValueOnce(error);
+
+        await expect(assetOperation.moveAsset(source, target, { overwrite: false })).rejects.toBe(error);
+
+        expect(mockMoveAssetSource).toHaveBeenCalledWith(source, target, { overwrite: false });
+        expect(mockRefresh).not.toHaveBeenCalled();
+        expect(mockAutoRefreshAssetLazy).not.toHaveBeenCalled();
+        expect(mockAddTask).toHaveBeenCalledTimes(1);
     });
 
     it('importAsset should delegate copy to filesystem bridge', async () => {
@@ -593,6 +651,16 @@ describe('asset operation filesystem bridge', () => {
         await assetOperation.refreshAsset('assets/resources/Image');
 
         expect(mockRefresh).toHaveBeenCalledWith('db://assets/resources/Image');
+    });
+
+    it('refreshAssetOnly skips the follow-up directory refresh for generated assets', async () => {
+        const { assetOperation } = require('../manager/operation') as typeof import('../manager/operation');
+        setAssetDBInfo();
+
+        await assetOperation.refreshAssetOnly('db://assets/resources/Image/generated.png');
+
+        expect(mockRefresh).toHaveBeenCalledWith('db://assets/resources/Image/generated.png');
+        expect(mockAutoRefreshAssetLazy).not.toHaveBeenCalled();
     });
 
     it('importAsset should refresh an existing file in the asset DB when source and target are the same path', async () => {

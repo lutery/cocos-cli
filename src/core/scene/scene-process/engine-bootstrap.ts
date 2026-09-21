@@ -1,12 +1,16 @@
+import type { IReflectionProbeSceneIdentity } from '../common/reflection-probe';
 import * as EditorExtends from '../../engine/editor-extends';
 import { Rpc } from './rpc';
 import { serviceManager } from './service/service-manager';
 import { Service as DecoratorService } from './service/core/decorator';
+import { ServiceEvents } from './service/core';
 import { ReferenceImageService } from './service/reference-image';
 import { messageManager } from './service/message';
 import { initLocalI18n } from './i18n';
 import { CUSTOM_PIPELINE_MODULE } from '../../engine/graphics-config';
 import { fetchSceneEditorSettings, syncSceneEditorBundles } from './scene-editor-assets';
+import { installLightProbeNormalReset } from './light-probe-normal-reset';
+import type { IEditorSessionService } from './service/core/editor-session';
 
 import './service';
 
@@ -120,6 +124,10 @@ export async function startup(options: {
     cc.physics.selector.runInEditor = true;
 
     await cc.game.init(config);
+    installLightProbeNormalReset(cc);
+    // scene 进程运行在编辑器内嵌视图中，屏幕方向无意义；项目设置默认 'auto' 会让
+    // screenAdapter.orientation 停在 Orientation.AUTO(13)，引擎 resize 时对未映射方向打 DEBUG 告警，这里固定为竖屏。
+    cc.view.setOrientation(cc.macro.ORIENTATION_PORTRAIT);
     await syncSceneEditorBundles(serverURL, sceneEditorSettings?.bundleConfigs);
 
     let backend = 'builtin';
@@ -231,6 +239,32 @@ async function setupBrowserInvokeChannel(serverURL: string) {
             return;
         }
         const socket = io(serverURL);
+        let rendererVisible: boolean | undefined;
+        const updateRendererVisibility = (visible: boolean) => {
+            rendererVisible = visible;
+            socket.emit('scene-renderer:visibility', { visible });
+        };
+        // Pink retains a hidden, empty Scene Webview for preloading. Track the
+        // host-reported visibility without taking over Pink's bridge, so Node-side
+        // tools select the displayed scene.
+        window.addEventListener('message', (event: MessageEvent) => {
+            const message = event.data;
+            if (message?.kind === 'event'
+                && message.event === 'editor:visibility-changed'
+                && typeof message.data?.visible === 'boolean') {
+                updateRendererVisibility(message.data.visible);
+            }
+        });
+        ServiceEvents.on('scene-view:visibility-changed', updateRendererVisibility);
+        const querySceneUrl = async (): Promise<string> => {
+            const current = await DecoratorService.Editor.queryCurrent();
+            return (current as any)?.__identifier__?.assetUrl ?? (current as any)?.assetUrl ?? '';
+        };
+        let rendererSceneUrl = '';
+        const updateRendererScene = (sceneUrl: string) => {
+            rendererSceneUrl = sceneUrl;
+            socket.emit('scene-renderer:scene', { sceneUrl });
+        };
         const invoke = (module: string, method: string, args?: any[]) => {
             try {
                 const svc = (DecoratorService as any)[module];
@@ -246,11 +280,222 @@ async function setupBrowserInvokeChannel(serverURL: string) {
                 invoke(msg.module, msg.method, msg.args);
             }
         });
+        socket.on('scene:invoke-lightfx', async (
+            msg: {
+                sceneUrl?: string;
+                module?: 'LightProbeBake' | 'LightmapBake';
+                method?: 'bake' | 'querySettings' | 'queryBakeInfo' | 'queryCapabilities' | 'clearBake' | 'cancel';
+                args?: unknown[];
+            },
+            reply: (response: { result?: unknown; sceneUrl?: string; error?: string }) => void,
+        ) => {
+            try {
+                const methods = msg?.module === 'LightProbeBake'
+                    ? new Set(['bake', 'querySettings', 'queryCapabilities', 'clearBake', 'cancel'])
+                    : msg?.module === 'LightmapBake'
+                        ? new Set(['bake', 'queryCapabilities', 'queryBakeInfo', 'clearBake', 'cancel'])
+                        : null;
+                if (!methods?.has(msg.method || '')) {
+                    throw new Error('Invalid LightFX scene request.');
+                }
+
+                if (msg.module === 'LightProbeBake' && msg.method === 'querySettings') {
+                    // This frequently polled read must not call queryCurrent(), which
+                    // encodes all baked probes and tetrahedra just to obtain the URL.
+                    const editor = DecoratorService.Editor as typeof DecoratorService.Editor & IEditorSessionService;
+                    const session = editor.getEditorSession();
+                    const scene = cc.director.getScene();
+                    const assertCurrent = () => {
+                        if (!scene || cc.director.getScene() !== scene || !editor.isCurrentEditorSession(session)) {
+                            throw new Error('The source scene changed during the light-probe settings query.');
+                        }
+                    };
+                    assertCurrent();
+                    if (!session.uuid || editor.getCurrentEditorType() !== 'scene') {
+                        throw new Error('Light-probe settings require an open scene.');
+                    }
+                    const assetInfo = await Rpc.getInstance().request('assetManager', 'queryAssetInfo', [session.uuid]);
+                    assertCurrent();
+                    const sceneUrl = assetInfo?.url;
+                    if (!sceneUrl || sceneUrl !== msg.sceneUrl) {
+                        throw new Error(`The selected scene renderer is not displaying the requested scene: ${msg.sceneUrl || 'unknown'}.`);
+                    }
+                    const result = await DecoratorService.LightProbeBake.querySettings();
+                    assertCurrent();
+                    reply({ result, sceneUrl });
+                    return;
+                }
+
+                const currentSceneUrl = await querySceneUrl();
+                if (msg.method !== 'cancel' && (!currentSceneUrl || currentSceneUrl !== msg.sceneUrl)) {
+                    throw new Error(
+                        `The selected scene renderer is not displaying the requested scene: ${msg.sceneUrl || 'unknown'}.`,
+                    );
+                }
+
+                const service = (DecoratorService as any)[msg.module!];
+                const result = await service[msg.method!](...(msg.args || []));
+                const finalSceneUrl = await querySceneUrl().catch(() => '');
+                if (finalSceneUrl) updateRendererScene(finalSceneUrl);
+                reply({ result, sceneUrl: finalSceneUrl });
+            } catch (error) {
+                reply({ error: error instanceof Error ? error.message : String(error) });
+            }
+        });
+        socket.on('scene:capture-reflection-probe', async (
+            msg: { source?: IReflectionProbeSceneIdentity; sceneUrl?: string; nodePath?: string; componentUuid?: string; timeoutMs?: number },
+            reply: (response: { result?: unknown; error?: string }) => void,
+        ) => {
+            try {
+                if (!msg?.nodePath) {
+                    throw new Error('Invalid reflection-probe capture request.');
+                }
+                if (msg.sceneUrl) {
+                    const currentSceneUrl = await querySceneUrl().catch(() => '');
+                    if (currentSceneUrl !== msg.sceneUrl) {
+                        throw new Error(
+                            `The WebGL scene renderer is not displaying the requested scene: ${msg.sceneUrl}.`,
+                        );
+                    }
+                }
+                const result = await (DecoratorService.ReflectionProbe as any).capturePixels(
+                    msg.nodePath,
+                    msg.timeoutMs,
+                    msg.componentUuid, msg.source,
+                );
+                updateRendererScene(result.sceneUrl);
+                reply({ result });
+            } catch (error) {
+                reply({ error: error instanceof Error ? error.message : String(error) });
+            }
+        });
+        socket.on('scene:list-reflection-probes', async (
+            msg: { sceneUrl?: string; source?: IReflectionProbeSceneIdentity },
+            reply: (response: { result?: unknown; error?: string }) => void,
+        ) => {
+            try {
+                const currentSceneUrl = await querySceneUrl().catch(() => '');
+                if (!msg?.sceneUrl || currentSceneUrl !== msg.sceneUrl) {
+                    throw new Error(
+                        `The WebGL scene renderer is not displaying the requested scene: ${msg?.sceneUrl || 'unknown'}.`,
+                    );
+                }
+                if (msg.source) { (DecoratorService.ReflectionProbe as any).assertSceneIdentity(msg.source); }
+                const source = await DecoratorService.ReflectionProbe.getSceneIdentity();
+                const probes = (DecoratorService.ReflectionProbe as any).listBakeableProbes();
+                reply({ result: { sceneUrl: currentSceneUrl, probes, source } });
+            } catch (error) {
+                reply({ error: error instanceof Error ? error.message : String(error) });
+            }
+        });
+        socket.on('scene:apply-reflection-probe', async (
+            msg: {
+                sceneUrl?: string;
+                nodePath?: string;
+                componentUuid?: string;
+                cubemapUuid?: string;
+                captureToken?: string;
+                source?: IReflectionProbeSceneIdentity;
+                saveScene?: boolean;
+                timeoutMs?: number;
+            },
+            reply: (response: { result?: unknown; error?: string }) => void,
+        ) => {
+            try {
+                if (!msg?.sceneUrl || !msg.nodePath || !msg.componentUuid || !msg.cubemapUuid || !msg.captureToken) {
+                    throw new Error('Invalid reflection-probe apply request.');
+                }
+                const result = await (DecoratorService.ReflectionProbe as any).applyBakedCubemap({
+                    sceneUrl: msg.sceneUrl,
+                    nodePath: msg.nodePath,
+                    componentUuid: msg.componentUuid,
+                    cubemapUuid: msg.cubemapUuid,
+                    captureToken: msg.captureToken,
+                    source: msg.source,
+                    saveScene: msg.saveScene !== false,
+                    timeoutMs: msg.timeoutMs,
+                    serverURL,
+                });
+                updateRendererScene(msg.sceneUrl);
+                reply({ result });
+            } catch (error) {
+                reply({ error: error instanceof Error ? error.message : String(error) });
+            }
+        });
+        socket.on('scene:save-reflection-probes', async (
+            msg: { sceneUrl?: string; source?: IReflectionProbeSceneIdentity },
+            reply: (response: { result?: unknown; error?: string }) => void,
+        ) => {
+            try {
+                const currentSceneUrl = await querySceneUrl().catch(() => '');
+                if (!msg?.sceneUrl || currentSceneUrl !== msg.sceneUrl) {
+                    throw new Error(
+                        `The WebGL scene renderer is not displaying the requested scene: ${msg?.sceneUrl || 'unknown'}.`,
+                    );
+                }
+                if (msg.source) { (DecoratorService.ReflectionProbe as any).assertSceneIdentity(msg.source); }
+                await DecoratorService.Editor.save({});
+                DecoratorService.Undo.markSaved();
+                updateRendererScene(currentSceneUrl);
+                reply({ result: { saved: true, sceneUrl: currentSceneUrl } });
+            } catch (error) {
+                reply({ error: error instanceof Error ? error.message : String(error) });
+            }
+        });
+        socket.on('scene:clear-reflection-probes', async (
+            msg: {
+                sceneUrl?: string;
+                source?: IReflectionProbeSceneIdentity;
+                saveScene?: boolean;
+                timeoutMs?: number;
+            },
+            reply: (response: { result?: unknown; error?: string }) => void,
+        ) => {
+            try {
+                if (!msg?.sceneUrl) {
+                    throw new Error('Invalid reflection-probe clear request.');
+                }
+                const result = await (DecoratorService.ReflectionProbe as any).clearBakedCubemaps({
+                    sceneUrl: msg.sceneUrl,
+                    source: msg.source,
+                    saveScene: msg.saveScene !== false,
+                    timeoutMs: msg.timeoutMs,
+                });
+                updateRendererScene(msg.sceneUrl);
+                reply({ result });
+            } catch (error) {
+                reply({ error: error instanceof Error ? error.message : String(error) });
+            }
+        });
         // Reconcile feature-local runtime state after first connection or reconnect.
         // Reference images need this because their Sprite objects are not persisted with configuration.
         socket.on('connect', () => {
             invoke('Engine', 'syncDesignResolution', []);
             invoke('ReferenceImage', 'syncFromAuthority', []);
+            // Join the renderer room immediately, then publish its scene once
+            // the editor service is ready.
+            socket.emit('scene-renderer:register', {
+                sceneUrl: rendererSceneUrl,
+                visible: rendererVisible,
+            });
+            void querySceneUrl().then((sceneUrl) => {
+                updateRendererScene(sceneUrl);
+            }).catch(() => {
+                // Registering without a scene still makes the renderer
+                // discoverable; capture will report a precise scene error.
+            });
+        });
+        const reportRendererScene = () => {
+            void querySceneUrl().then((sceneUrl) => {
+                updateRendererScene(sceneUrl);
+            }).catch(() => {
+                updateRendererScene('');
+            });
+        };
+        ServiceEvents.on('editor:open', reportRendererScene);
+        ServiceEvents.on('editor:reload', reportRendererScene);
+        ServiceEvents.on('editor:close', () => {
+            updateRendererScene('');
         });
     } catch (e) {
         console.warn('[engine-bootstrap] setup browser-invoke channel failed:', e);
