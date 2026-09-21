@@ -241,11 +241,11 @@ export async function executeBuildStageTask(taskId: string, stageName: string, o
 
     try {
         options.dest = utils.Path.resolveToRaw(options.dest);
-        const buildOptions = readBuildTaskOptions(options.dest);
-        if (!buildOptions) {
-            throw new Error('Build options is not exist!');
-        }
-        mergeBuildStageRuntimeOptions(buildOptions, options);
+        // Web platforms no longer emit cocos.compile.config.json (requiredBuildOptions: false),
+        // so synthesize minimal options instead of reading — same rule as
+        // readBuildOptionsForBuildStage, which executeBuildStageTask had missed (breaks `cocos run`).
+        // Note: the helper already applies mergeBuildStageRuntimeOptions.
+        const buildOptions = readBuildOptionsForBuildStage(options);
         let result: IBuildResultData;
         if (shouldCascadeBuildStage(options, buildOptions)) {
             result = await executeBuildStageTaskCascade(taskId, stageName, options, buildOptions, onProgress, restoreLogSink);
