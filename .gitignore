@@ -53,3 +53,10 @@ profiles/cocos.config.json
 
 # performance profiling artifacts
 perf/
+
+# local build logs & scratch files (CLI writes temp/builder/log when invoked from the repo root)
+/temp/
+/*.log
+
+# local scratch notes
+/continue.md
