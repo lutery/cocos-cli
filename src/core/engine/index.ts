@@ -414,6 +414,12 @@ class EngineManager implements IEngine {
                 cloneDeep(configInstance.getDefaultConfig() || {}),
                 projectConfig,
             ) as IEngineConfig & IEngineProjectConfig;
+            // 项目显式 includeModules 必须**原样生效**：lodash merge 对数组按索引合并
+            // （project 项占前 N 位、默认列表从第 N 位续上）会形成"并集"假象，导致引擎模块裁剪失效
+            // （实测：项目 13 项 + 默认 20 项 = 33 项入引擎，bullet/spine 等零引用模块无法裁掉）。
+            if (Object.prototype.hasOwnProperty.call(projectConfig, 'includeModules') && Array.isArray(projectConfig.includeModules)) {
+                mergedConfig.includeModules = [...projectConfig.includeModules];
+            }
             const moduleConfig = this.getSelectedModuleProjectConfig(mergedConfig);
 
             if (moduleConfig) {

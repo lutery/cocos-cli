@@ -1,7 +1,7 @@
 'use strict';
 
 import Ejs from 'ejs';
-import { copyFileSync, outputFileSync } from 'fs-extra';
+import { copyFileSync, existsSync, outputFileSync } from 'fs-extra';
 import { execFile } from 'child_process';
 import { join } from 'path';
 import { BuilderCache, IBuilder, IBuildStageTask, IInterBuildTaskOption, InternalBuildResult } from '../../../@types/protected';
@@ -124,6 +124,23 @@ export async function onBeforeCopyBuildTemplate(this: IBuilder, options: IInterB
         }
         result.paths.gameJson = join(outDir, 'game.json');
         outputFileSync(result.paths.gameJson, JSON.stringify(gameJson, null, debug ? 4 : 0), 'utf8');
+        // 4b. WeChat validates that each declared subpackage root contains a game.js entry
+        //     (resource-only subpackages still require the file; DevTools import fails otherwise).
+        //     WeChat executes game.js when the subpackage loads — it must require the bundle's
+        //     index.js so its SystemJS registrations run; otherwise loadBundle fails with
+        //     "Unable to instantiate virtual:///prerequisite-imports/<name> from undefined".
+        for (const sub of subpackageNames) {
+            const subRoot = join(outDir, 'subpackages', sub);
+            if (!existsSync(subRoot)) {
+                continue;
+            }
+            const subGameJs = join(subRoot, 'game.js');
+            const subIndexJs = join(subRoot, 'index.js');
+            if (!existsSync(subGameJs)) {
+                const content = existsSync(subIndexJs) ? "require('./index.js');\n" : '// subpackage bootstrap: resource-only bundle (no executable entry)\n';
+                outputFileSync(subGameJs, content, 'utf8');
+            }
+        }
     }
 
     // 5. project.config.json — what WeChat DevTools opens. Note: do NOT register these two files
