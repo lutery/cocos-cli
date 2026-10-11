@@ -14,8 +14,10 @@ jest.mock('ejs', () => ({ __esModule: true, default: { renderFile: (...args: any
 
 const mockCopyFileSync = jest.fn();
 const mockOutputFileSync = jest.fn();
+const mockExistsSync = jest.fn().mockReturnValue(false);
 jest.mock('fs-extra', () => ({
     __esModule: true,
+    existsSync: (...args: any[]) => (mockExistsSync as any)(...args),
     copyFileSync: (...args: any[]) => mockCopyFileSync(...args),
     outputFileSync: (...args: any[]) => mockOutputFileSync(...args),
 }));
@@ -96,6 +98,7 @@ function makeBuilder(buildTemplateOverrides: Record<string, any> = {}) {
 beforeEach(() => {
     jest.clearAllMocks();
     mockRenderFile.mockImplementation(async (tpl: string, data: any) => `RENDERED(${tpl})(${JSON.stringify(data)})`);
+    mockExistsSync.mockImplementation(() => false); // default: no subpackage dirs on disk
 });
 
 describe('onAfterInit', () => {
@@ -194,6 +197,32 @@ describe('onBeforeCopyBuildTemplate', () => {
         expect(gameJson.subpackages).toEqual([{ name: 'sub1', root: 'subpackages/sub1' }]);
         // WeChat DevTools (lib 3.17+) rejects an empty-string openDataContext; the field must be omitted.
         expect(gameJson).not.toHaveProperty('openDataContext');
+    });
+
+    test('generates subpackage game.js bootstrap entries (executable requires index.js; resource-only gets a comment)', async () => {
+        const options = makeOptions();
+        const result = makeResult();
+        result.settings.assets.subpackages = ['sub1', 'res-only'];
+        mockExistsSync.mockImplementation((p: string) => {
+            const n = String(p).replace(/\\/g, '/');
+            if (n === 'C:/out/subpackages/sub1' || n === 'C:/out/subpackages/res-only') {
+                return true; // both subpackage roots exist
+            }
+            if (n === 'C:/out/subpackages/sub1/index.js') {
+                return true; // executable subpackage
+            }
+            return false; // res-only has no index.js; neither has a game.js yet
+        });
+
+        await hooks.onBeforeCopyBuildTemplate.call(makeBuilder(), options, result);
+
+        const writes = mockOutputFileSync.mock.calls.map(([dest, content]) => [String(dest).replace(/\\/g, '/'), String(content)]);
+        const executable = writes.find(([dest]) => dest === 'C:/out/subpackages/sub1/game.js');
+        expect(executable).toBeDefined();
+        expect(executable![1]).toContain("require('./index.js')");
+        const resourceOnly = writes.find(([dest]) => dest === 'C:/out/subpackages/res-only/game.js');
+        expect(resourceOnly).toBeDefined();
+        expect(resourceOnly![1]).toContain('resource-only');
     });
 
     test('emits project.config.json for WeChat DevTools with appid fallback and compileType game', async () => {
