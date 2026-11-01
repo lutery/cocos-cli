@@ -55,6 +55,7 @@ export interface IGizmoConfig {
 
 export interface ISceneViewConfig {
     sceneLightOn: boolean;
+    initialModes?: Record<string, '2d' | '3d'>;
 }
 
 export interface ISceneConfig {
@@ -183,6 +184,26 @@ class SceneConfig {
 
     public get<T>(path?: string, scope?: ConfigurationScope): Promise<T> {
         return this.configInstance.get(path, scope);
+    }
+
+    public async queryDesignResolution() {
+        const { Engine } = await import('../engine');
+        const { configurationManager } = await import('../configuration');
+        const { pathExists, readJSON } = await import('fs-extra');
+        let resolution = Engine.getConfig().designResolution;
+        const configPath = await configurationManager.getConfigPath();
+        if (await pathExists(configPath)) {
+            const disk = (await readJSON(configPath))?.engine?.designResolution;
+            if (typeof disk?.width === 'number' && typeof disk?.height === 'number') resolution = { ...resolution, ...disk };
+        }
+        return resolution;
+    }
+
+    async recordInitialView(uuid: string, mode: '2d' | '3d'): Promise<void> {
+        if (!this.configInstance) await this.init();
+        const local = this.configInstance.getAll('local') || {};
+        if (local.sceneView?.initialModes?.[uuid] !== undefined) return;
+        await this.configInstance.set(`sceneView.initialModes.${uuid}`, mode, 'local');
     }
 
     public set(path: string, value: any, scope?: ConfigurationScope) {

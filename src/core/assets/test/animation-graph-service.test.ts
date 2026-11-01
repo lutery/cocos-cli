@@ -31,6 +31,8 @@ import { TestGlobalEnv } from '../../../tests/global-env';
 import { assetManager } from '..';
 import animationGraph from '../animation-graph-service';
 import type { IProperty } from '../../scene/@types/public';
+import type { IAssetInfo } from '../@types/public';
+import scriptManager from '../../scripting';
 
 describe('animation graph asset service', () => {
     const name = `animation-graph-service-${Date.now()}`;
@@ -44,6 +46,56 @@ describe('animation graph asset service', () => {
 
     beforeAll(async () => {
         await globalSetup();
+    });
+
+    it.each([
+        ['animation-graph', 'animgraph', 'cc.animation.AnimationGraph'],
+        ['animation-graph-variant', 'animgraphvari', 'cc.animation.AnimationGraphVariant'],
+    ])('queries registered types and inheritance in %s asset events', async (importer, extension, type) => {
+        const added: IAssetInfo[] = [];
+        const changed: IAssetInfo[] = [];
+        const removeAdded = assetManager.onAssetAdded(info => added.push(info));
+        const removeChanged = assetManager.onAssetChanged(info => changed.push(info));
+        try {
+            const asset = await assetManager.createAsset({
+                target: join(TestGlobalEnv.testRoot, `${name}-type.${extension}`),
+                content: readFileSync(join(TestGlobalEnv.engineRoot,
+                    `editor/assets/default_file_content/${importer}/default.${extension}`), 'utf8'),
+                overwrite: true,
+            });
+            const expected = {
+                uuid: asset.uuid,
+                type,
+                extends: expect.arrayContaining(['cc.animation.AnimationGraphLike', 'cc.Asset']),
+            };
+            expect(assetManager.queryAssetInfo(asset.uuid, ['extends'])).toMatchObject(expected);
+            expect(assetManager.queryAssetInfos({ ccType: type }, ['extends']))
+                .toEqual(expect.arrayContaining([expect.objectContaining(expected)]));
+            expect(added.find(info => info.uuid === asset.uuid)).toMatchObject(expected);
+            await assetManager.reimportAsset(asset.uuid);
+            expect(changed.find(info => info.uuid === asset.uuid)).toMatchObject(expected);
+        } finally {
+            removeAdded();
+            removeChanged();
+        }
+    });
+
+    it('saves and reloads a variant referencing a registered animation graph', async () => {
+        const graph = await assetManager.createAsset({
+            target: join(TestGlobalEnv.testRoot, `${name}-variant-original.animgraph`),
+            content: getDefaultGraphContent(),
+            overwrite: true,
+        });
+        const variant = await assetManager.createAsset({
+            target: join(TestGlobalEnv.testRoot, `${name}-variant.animgraphvari`),
+            content: readFileSync(join(TestGlobalEnv.engineRoot,
+                'editor/assets/default_file_content/animation-graph-variant/default.animgraphvari'), 'utf8'),
+            overwrite: true,
+        });
+        await assetManager.queryAnimationGraphVariant(variant.uuid);
+        await assetManager.changeAnimationGraphVariant(variant.uuid, { graphUuid: graph.uuid, clips: {} });
+        await assetManager.saveAnimationGraphVariant(variant.uuid);
+        expect(await assetManager.queryAnimationGraphVariant(variant.uuid)).toEqual({ graphUuid: graph.uuid, clips: {}, invalids: {} });
     });
 
     afterAll(async () => {
@@ -1490,6 +1542,46 @@ describe('animation graph asset service', () => {
         }
         const restored = await assetManager.queryAnimationGraphStateMachineComponentTypes();
         expect(restored).not.toContain(className);
+    });
+
+    it('discovers a compiled project state component and preserves it through save and reload (BUG 1464)', async () => {
+        const className = 'Bug1464ProjectStateComponent';
+        const script = await assetManager.createAsset({
+            target: join(TestGlobalEnv.testRoot, `${name}-state-component.ts`),
+            content: `import { _decorator, animation } from 'cc';
+                @_decorator.ccclass('${className}')
+                export class ${className} extends animation.StateMachineComponent {}`,
+            overwrite: true,
+        });
+        try {
+            await scriptManager.compileScripts();
+            expect(await assetManager.queryAnimationGraphStateMachineComponentTypes()).toContain(className);
+            const graphPath = join(TestGlobalEnv.testRoot, `${name}-custom-component.animgraph`);
+            const graph = await assetManager.createAsset({
+                target: graphPath,
+                content: getDefaultGraphContent(),
+                overwrite: true,
+            });
+            const initial = await assetManager.queryAnimationGraph(graph.uuid);
+            const added = await assetManager.executeAnimationGraphCommand(graph.uuid, {
+                command: { type: 'add-state', layerIndex: 0, stateMachinePath: [], stateType: 'motion', name: 'Custom' },
+                expected: initial,
+            });
+            const state = added.graph.layers[0].stateMachine.states.find(state => state.name === 'Custom')!;
+            const attached = await assetManager.executeAnimationGraphCommand(graph.uuid, {
+                command: { type: 'add-state-component', layerIndex: 0, stateMachinePath: [], stateIndex: state.index, componentType: className },
+                expected: added,
+            });
+            expect(attached.graph.layers[0].stateMachine.states[state.index].components).toHaveLength(1);
+            await assetManager.saveAnimationGraph(graph.uuid, attached);
+            const reloaded = await assetManager.reloadAnimationGraph(graph.uuid);
+            expect(reloaded.graph.layers[0].stateMachine.states[state.index].components).toHaveLength(1);
+            expect(readFileSync(graphPath, 'utf8')).toContain(className);
+        } finally {
+            await assetManager.removeAsset(script.uuid);
+            await scriptManager.compileScripts();
+            expect(await assetManager.queryAnimationGraphStateMachineComponentTypes()).not.toContain(className);
+        }
     });
 
     it('blocks generic overwrite and directory mutations while a graph document is dirty', async () => {

@@ -32,7 +32,7 @@ import type {
     ReloadAnimationGraphOptions,
     SetAnimationGraphInspectorPropertyRequest,
 } from './@types/public';
-import type { IProperty } from '../scene/@types/public';
+import type { IProperty } from '../base/property';
 import { deserialize as deserializeAssetSource, i18nTranslate } from './asset-handler/utils';
 import assetOperation from './manager/operation';
 import assetQuery from './manager/query';
@@ -242,6 +242,7 @@ class AnimationGraphAssetService {
     }
 
     async queryStateMachineComponentTypes(): Promise<string[]> {
+        await this._loadProjectScripts();
         const js = getCC().js;
         const base = js.getClassByName('cc.animation.StateMachineComponent');
         if (!base) {
@@ -417,7 +418,7 @@ class AnimationGraphAssetService {
 
     async runExternalWrite<T>(uuidOrUrlOrPath: string, write: () => Promise<T>): Promise<T> {
         const asset = assetQuery.queryAsset(uuidOrUrlOrPath);
-        if (!asset || (asset.meta?.importer !== 'animation-graph' && (asset as any).type !== 'cc.AnimationGraph')) {
+        if (!asset || (asset.meta?.importer !== 'animation-graph' && (asset as any).type !== 'cc.animation.AnimationGraph')) {
             return write();
         }
         return this.runExternalWrites([asset.uuid], write);
@@ -457,6 +458,7 @@ class AnimationGraphAssetService {
     }
 
     private async _getOrLoad(asset: IAsset): Promise<AnimationGraphDocument> {
+        await this._loadProjectScripts();
         const existing = this._documents.get(asset.uuid);
         if (existing) {
             return existing;
@@ -467,6 +469,7 @@ class AnimationGraphAssetService {
     }
 
     private async _loadDocument(asset: IAsset): Promise<AnimationGraphDocument> {
+        await this._loadProjectScripts();
         const content = await readFile(asset.source, 'utf8');
         let serialized: unknown;
         try {
@@ -492,6 +495,14 @@ class AnimationGraphAssetService {
         };
     }
 
+    private async _loadProjectScripts(): Promise<void> {
+        const { default: scriptManager } = await import('../scripting');
+        await scriptManager.ensureScriptsLoaded(
+            assetQuery.queryAssetInfos({ ccType: 'cc.Script' }).map(asset => asset.uuid),
+            assetQuery.querySortedPlugins({ loadPluginInEditor: true }),
+        );
+    }
+
     private _queryAnimationGraphAsset(uuidOrUrlOrPath: string): IAsset {
         const asset = assetQuery.queryAsset(uuidOrUrlOrPath);
         if (!asset) {
@@ -499,8 +510,8 @@ class AnimationGraphAssetService {
         }
         const importer = asset.meta?.importer;
         const type = (asset as any).type;
-        if (importer !== 'animation-graph' && type !== 'cc.AnimationGraph') {
-            throw new Error(`Expected cc.AnimationGraph asset, got importer ${importer || 'unknown'} type ${type || 'unknown'}: ${uuidOrUrlOrPath}`);
+        if (importer !== 'animation-graph' && type !== 'cc.animation.AnimationGraph') {
+            throw new Error(`Expected cc.animation.AnimationGraph asset, got importer ${importer || 'unknown'} type ${type || 'unknown'}: ${uuidOrUrlOrPath}`);
         }
         if (!asset.source) {
             throw new Error(`Animation Graph asset has no source file: ${uuidOrUrlOrPath}`);
